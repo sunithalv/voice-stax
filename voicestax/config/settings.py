@@ -69,7 +69,7 @@ class VoiceSettings(BaseSettings):
     @classmethod
     def append_json_structure(cls, v: str) -> str:
         # Avoid double-appending if already present
-        if '"intent"' not in v:
+        if JSON_STRUCTURE_SUFFIX.strip() not in v:
             return v + JSON_STRUCTURE_SUFFIX
         return v
 
