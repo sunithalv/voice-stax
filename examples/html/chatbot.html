@@ -1,0 +1,487 @@
+
+<!--
+=============================================================
+  VoiceStax Chatbot UI — Configuration Guide
+=============================================================
+
+QUICK START:
+  Copy this file into your project and serve it via FastAPI.
+  Most users only need to change sections marked 🔧.
+
+🔧 1. BRANDING
+   - <title> tag          → browser tab name
+   - .logo text           → sidebar logo name
+   - .header-title text   → chat panel heading
+
+🔧 2. THEME (CSS variables at top of <style>)
+   - --green              → AI accent color
+   - --blue               → user message color
+   - --bg / --surface     → background colors
+
+🔧 3. VAD SENSITIVITY (JavaScript constants)
+   - VAD_THRESHOLD        → mic sensitivity (default 0.015)
+                            increase if AI interrupts too easily
+   - VAD_COOLDOWN_MS      → interrupt cooldown (default 400ms)
+
+⚙️  4. WEBSOCKET URL (only if using custom path/port)
+   - WS_URL               → update /ws/chat if your route differs
+
+⚙️  5. AUDIO SAMPLE RATES (only if changing STT/TTS models)
+   - micAudioContext      → sampleRate must match STT (default 16000)
+   - playAudioContext     → sampleRate must match TTS (default 24000)
+
+DO NOT CHANGE:
+   - Message type handlers (greeting_started, word, complete etc.)
+     These are part of the VoiceStax protocol.
+=============================================================
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Stax: Full-Stack Voice AI</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#0a0c14;--surface:#111522;--surface2:#161b2e;--border:#1e2540;
+    --green:#00e5a0;--green-dim:#00e5a022;--blue:#3d7fff;--blue-dim:#3d7fff22;
+    --muted:#4a5270;--text:#dde3f5;--text-dim:#7a85a8;
+  }
+  body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;min-height:100vh;overflow:hidden;}
+  body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px;opacity:.25;pointer-events:none;z-index:0;}
+  .container{position:relative;z-index:1;width:100%;max-width:1080px;height:92vh;display:flex;background:var(--surface);border:1px solid var(--border);border-radius:20px;overflow:hidden;box-shadow:0 0 80px #00e5a010,0 40px 100px #00000080;}
+  .sidebar{width:220px;background:var(--surface2);border-right:1px solid var(--border);padding:28px 20px;display:flex;flex-direction:column;gap:24px;}
+  .logo{font-family:'Space Mono',monospace;font-size:16px;font-weight:700;color:var(--green);letter-spacing:0.05em;display:flex;align-items:center;gap:8px;}
+  .logo .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 2s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.8)}}
+  .status-block{padding:12px 14px;background:var(--bg);border:1px solid var(--border);border-radius:10px;font-size:12px;color:var(--text-dim);}
+  .status-block .label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+  .status-block .val{color:var(--text);font-weight:500}
+  .indicator{margin-top:auto;height:3px;border-radius:2px;background:var(--border);overflow:hidden;}
+  .indicator-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--green),var(--blue));border-radius:2px;transition:width .3s;}
+  .chat{flex:1;display:flex;flex-direction:column;}
+  .header{padding:16px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--surface2);}
+  .header-title{font-family:'Space Mono',monospace;font-size:13px;color:var(--text-dim);letter-spacing:.04em;}
+  .state-badge{font-size:11px;padding:4px 12px;border-radius:20px;background:var(--green-dim);border:1px solid #00e5a040;color:var(--green);font-family:'Space Mono',monospace;letter-spacing:.04em;transition:all .3s;}
+  .state-badge.speaking{background:var(--blue-dim);border-color:#3d7fff40;color:var(--blue)}
+  .state-badge.error{background:#ff3d3d22;border-color:#ff3d3d40;color:#ff7070}
+  .state-badge.interrupted{background:#ffaa0022;border-color:#ffaa0040;color:#ffaa00}
+  .messages{flex:1;overflow-y:auto;padding:24px 20px;display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth;}
+  .messages::-webkit-scrollbar{width:4px}
+  .messages::-webkit-scrollbar-track{background:transparent}
+  .messages::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+  .msg{padding:12px 16px;border-radius:14px;max-width:72%;font-size:14px;line-height:1.6;animation:fadeUp .25s ease;}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+  .user{background:var(--blue-dim);border:1px solid #3d7fff30;align-self:flex-end;color:var(--text);}
+  .ai{background:var(--green-dim);border:1px solid #00e5a030;align-self:flex-start;color:var(--text);position:relative;}
+  .ai.streaming::after{content:'▋';color:var(--green);opacity:1;animation:blink .6s step-end infinite;margin-left:2px;font-size:12px;}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+  .system{align-self:center;font-size:11px;font-family:'Space Mono',monospace;color:var(--muted);padding:4px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;}
+  .error-msg{align-self:center;background:#ff3d3d18;border:1px solid #ff3d3d30;color:#ff7070;padding:8px 14px;border-radius:8px;font-size:13px;}
+  .controls{padding:16px 20px;border-top:1px solid var(--border);background:var(--surface2);display:flex;gap:10px;}
+  button{flex:1;padding:12px;border:none;border-radius:10px;cursor:pointer;font-family:'DM Sans',sans-serif;font-weight:500;font-size:14px;transition:all .2s;letter-spacing:.01em;}
+  button:disabled{opacity:.35;cursor:not-allowed;transform:none!important}
+  .start{background:var(--green);color:#0a0c14;}
+  .start:not(:disabled):hover{background:#00ffb4;transform:translateY(-1px);box-shadow:0 4px 20px #00e5a040}
+  .stop{background:#ff3d3d;color:#fff;}
+  .stop:not(:disabled):hover{background:#ff6060;transform:translateY(-1px);box-shadow:0 4px 20px #ff3d3d40}
+  .clear{flex:.5;background:var(--border);color:var(--text-dim);}
+  .clear:not(:disabled):hover{background:#2a3050;color:var(--text)}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="sidebar">
+    <div class="logo"><div class="dot"></div>VOICE STAX</div>
+    <div class="status-block"><div class="label">Connection</div><div class="val" id="conn">Connecting…</div></div>
+    <div class="status-block"><div class="label">Mode</div><div class="val" id="mode">—</div></div>
+    <div class="status-block"><div class="label">Words spoken</div><div class="val" id="wordcount">0</div></div>
+    <div class="indicator"><div class="indicator-fill" id="indBar"></div></div>
+  </div>
+  <div class="chat">
+    <div class="header">
+      <div class="header-title">AI ASSISTANT</div>
+      <div class="state-badge" id="ready">Initializing</div>
+    </div>
+    <div class="messages" id="chat"></div>
+    <div class="controls">
+      <button id="start" class="start" disabled>🎤 Start</button>
+      <button id="stop"  class="stop"  disabled>⏹ Stop</button>
+      <button id="clear" class="clear" disabled>🧹</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const WS_URL = `${location.protocol==="https:"?"wss":"ws"}://${location.host}/ws/chat`;
+
+let ws;
+let micAudioContext  = null;
+let playAudioContext = null;
+let processor        = null;
+let analyser         = null;
+let vadRafHandle     = null;
+let micStream        = null;
+let currentAudio     = null;
+let nextTime         = 0;
+let audioBufferChunks = [];
+let totalWords       = 0;
+
+let isAiSpeaking   = false;
+let interruptSent  = false;
+let sessionEnded   = false;
+
+const VAD_THRESHOLD    = 0.015;
+const VAD_COOLDOWN_MS  = 400;
+let   lastInterruptAt  = 0;
+
+let activeBubble   = null;
+let streamPhase    = null;
+let pendingWords   = [];
+let shownWordCount = 0;
+let rafHandle      = null;
+
+const chat        = document.getElementById("chat");
+const startBtn    = document.getElementById("start");
+const stopBtn     = document.getElementById("stop");
+const clearBtn    = document.getElementById("clear");
+const readyEl     = document.getElementById("ready");
+const modeEl      = document.getElementById("mode");
+const wordCountEl = document.getElementById("wordcount");
+const indBar      = document.getElementById("indBar");
+
+/* ── UI helpers ──────────────────────────────────────────────────────────────*/
+function setButtons(s,stop,clr){ startBtn.disabled=!s; stopBtn.disabled=!stop; clearBtn.disabled=!clr; }
+function setBadge(text,type=''){ readyEl.textContent=text; readyEl.className='state-badge'+(type?' '+type:''); }
+function addMsg(type,text){ const d=document.createElement("div"); d.className="msg "+type; d.textContent=text; chat.appendChild(d); chat.scrollTop=chat.scrollHeight; return d; }
+function addSystem(text){ addMsg("system",text); }
+function flashBar(){ indBar.style.width="100%"; setTimeout(()=>indBar.style.width="0%",600); }
+
+/* ── Streaming bubble ────────────────────────────────────────────────────────*/
+function createStreamBubble(){
+  if(activeBubble) finaliseStream();
+  activeBubble=document.createElement("div");
+  activeBubble.className="msg ai streaming";
+  chat.appendChild(activeBubble);
+  chat.scrollTop=chat.scrollHeight;
+  pendingWords=[]; shownWordCount=0;
+  return activeBubble;
+}
+function queueWord(word,index){ pendingWords.push({word,index}); }
+function revealWordNow(word,index){
+  if(!activeBubble) return;
+  activeBubble.textContent+=(index===0&&shownWordCount===0?"":" ")+word;
+  chat.scrollTop=chat.scrollHeight;
+  totalWords++; wordCountEl.textContent=totalWords; shownWordCount++;
+}
+function startWordSync(audio){
+  stopWordSync();
+  const OFFSET_S=-0.15;
+  function tick(){
+    if(!audio||audio.paused||audio.ended){ stopWordSync(); return; }
+    const dur=audio.duration, cur=audio.currentTime+OFFSET_S;
+    if(dur>0&&pendingWords.length>0){
+      const total=pendingWords.length+shownWordCount;
+      const targetShown=Math.min(total,Math.ceil((cur/dur)*total));
+      while(shownWordCount<targetShown&&pendingWords.length>0){
+        const{word,index}=pendingWords.shift();
+        revealWordNow(word,index); flashBar();
+      }
+    }
+    rafHandle=requestAnimationFrame(tick);
+  }
+  rafHandle=requestAnimationFrame(tick);
+}
+function stopWordSync(){ if(rafHandle!==null){cancelAnimationFrame(rafHandle);rafHandle=null;} }
+function finaliseStream(){
+  stopWordSync();
+  while(pendingWords.length>0){ const{word,index}=pendingWords.shift(); revealWordNow(word,index); }
+  if(activeBubble){ activeBubble.classList.remove("streaming"); activeBubble.removeAttribute("id"); activeBubble=null; }
+  streamPhase=null; shownWordCount=0;
+}
+
+/* ── VAD ─────────────────────────────────────────────────────────────────────*/
+function startVAD(){
+  if(!analyser) return;
+  stopVAD();
+  const bufLen = analyser.fftSize;
+  const buf    = new Float32Array(bufLen);
+
+  function vadTick(){
+    analyser.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for(let i=0;i<bufLen;i++) sum += buf[i]*buf[i];
+    const rms = Math.sqrt(sum/bufLen);
+
+    if(isAiSpeaking && rms > VAD_THRESHOLD){
+      const now = Date.now();
+      if(!interruptSent && now - lastInterruptAt > VAD_COOLDOWN_MS){
+        interruptSent   = true;
+        lastInterruptAt = now;
+        sendInterrupt();
+      }
+    } else if(rms < VAD_THRESHOLD * 0.5){
+      interruptSent = false;
+    }
+
+    vadRafHandle = requestAnimationFrame(vadTick);
+  }
+  vadRafHandle = requestAnimationFrame(vadTick);
+}
+
+function stopVAD(){
+  if(vadRafHandle !== null){ cancelAnimationFrame(vadRafHandle); vadRafHandle=null; }
+}
+
+function sendInterrupt(){
+  if(ws && ws.readyState === WebSocket.OPEN){
+    ws.send(JSON.stringify({type:"interrupt"}));
+    console.log("[VAD] Interrupt sent to server");
+    stopLocalAudio();
+    setBadge("Interrupted","interrupted");
+    modeEl.textContent="Listening";
+    addSystem("🎤 Listening...");
+  }
+}
+
+/* ── Stop local AI audio instantly ──────────────────────────────────────────*/
+function stopLocalAudio(){
+  isAiSpeaking = false;
+  if(currentAudio){
+    currentAudio.pause();
+    try{ URL.revokeObjectURL(currentAudio.src); }catch(_){}
+    currentAudio=null;
+  }
+  audioBufferChunks=[];
+  stopWordSync();
+  clearStream();
+}
+
+function clearStream() {
+    stopWordSync();
+    pendingWords = [];
+    if (activeBubble) {
+        activeBubble.classList.remove("streaming");
+        activeBubble = null;
+    }
+    streamPhase = null;
+    shownWordCount = 0;
+}
+
+/* ── PCM conversion ──────────────────────────────────────────────────────────*/
+function floatTo16BitPCM(float32){
+  const buf=new ArrayBuffer(float32.length*2);
+  const view=new DataView(buf);
+  for(let i=0,off=0;i<float32.length;i++,off+=2){
+    const s=Math.max(-1,Math.min(1,float32[i]));
+    view.setInt16(off,s<0?s*0x8000:s*0x7FFF,true);
+  }
+  return buf;
+}
+
+/* ── Playback AudioContext ───────────────────────────────────────────────────*/
+function initPlayContext(){
+  if(playAudioContext&&playAudioContext.state!=="closed") return;
+  playAudioContext=new AudioContext({sampleRate:24000});
+  nextTime=0;
+}
+
+/* ── Microphone ──────────────────────────────────────────────────────────────*/
+async function startMic(){
+  if(micStream) return;
+  if(!micAudioContext||micAudioContext.state==="closed"){
+    micAudioContext=new AudioContext({sampleRate:16000});
+  } else {
+    await micAudioContext.resume();
+  }
+  micStream=await navigator.mediaDevices.getUserMedia({
+    audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}
+  });
+  const source=micAudioContext.createMediaStreamSource(micStream);
+
+  analyser = micAudioContext.createAnalyser();
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = 0.3;
+  source.connect(analyser);
+
+  processor=micAudioContext.createScriptProcessor(2048,1,1);
+  source.connect(processor);
+  processor.connect(micAudioContext.destination);
+  processor.onaudioprocess=(e)=>{
+    if(ws.readyState!==WebSocket.OPEN) return;
+    ws.send(floatTo16BitPCM(e.inputBuffer.getChannelData(0)));
+  };
+
+  startVAD();
+}
+
+function stopMic(){
+  stopVAD();
+  if(processor){processor.disconnect();processor=null;}
+  if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}
+  analyser=null;
+}
+
+/* ── Audio playback ──────────────────────────────────────────────────────────*/
+function playBufferedAudio(){
+  if(!audioBufferChunks.length){ finaliseStream(); return; }
+  const byteArrays=audioBufferChunks.map(b64=>{
+    const bin=atob(b64); const bytes=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    return bytes;
+  });
+  const total=byteArrays.reduce((s,a)=>s+a.length,0);
+  const merged=new Uint8Array(total); let off=0;
+  for(const arr of byteArrays){merged.set(arr,off);off+=arr.length;}
+  const blob=new Blob([merged],{type:"audio/mpeg"});
+  const url=URL.createObjectURL(blob);
+  if(currentAudio){currentAudio.pause();stopWordSync();try{URL.revokeObjectURL(currentAudio.src);}catch(_){} currentAudio=null;}
+  const audio=new Audio(url);
+  currentAudio=audio;
+  audio.addEventListener("canplay",()=>{ startWordSync(audio); },{once:true});
+  audio.play().catch(err=>{
+    console.error("Audio play error:",err);
+    addMsg("error-msg","Audio playback failed: "+err.message);
+    finaliseStream();
+  });
+  audio.onended=()=>{
+    isAiSpeaking=false;
+    interruptSent=false;
+    stopWordSync();
+    finaliseStream();
+    try{URL.revokeObjectURL(url);}catch(_){}
+    if(sessionEnded){
+      sessionEnded=false;
+      setButtons(true,false,true);
+      setBadge("Ready");
+      modeEl.textContent="Idle";
+    }
+  };
+  audioBufferChunks=[];
+}
+
+function playStreamChunk(base64){
+  initPlayContext();
+  const bin=atob(base64); const bytes=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  const floatData=new Float32Array(bytes.buffer);
+  const buffer=playAudioContext.createBuffer(1,floatData.length,24000);
+  buffer.copyToChannel(floatData,0);
+  const source=playAudioContext.createBufferSource();
+  source.buffer=buffer; source.connect(playAudioContext.destination);
+  if(nextTime<playAudioContext.currentTime) nextTime=playAudioContext.currentTime;
+  source.start(nextTime); nextTime+=buffer.duration;
+}
+
+/* ── WebSocket ───────────────────────────────────────────────────────────────*/
+function connect(){
+  ws=new WebSocket(WS_URL);
+  setButtons(false,false,false);
+
+  ws.onopen=()=>{ document.getElementById("conn").textContent="Connected"; };
+
+  ws.onmessage=async(event)=>{
+    const msg=JSON.parse(event.data);
+
+    if(msg.type==="system_ready"){
+      setBadge("Ready"); modeEl.textContent="Idle"; setButtons(true,false,true); return;
+    }
+
+    if(msg.type==="greeting_started"){
+      isAiSpeaking=true;
+      interruptSent=false;
+      setBadge("Speaking","speaking"); modeEl.textContent="Greeting";
+      stopMic(); audioBufferChunks=[]; streamPhase="greeting";
+      // ── FIX: Do NOT call createStreamBubble() here.
+      // The bubble will be created lazily when the first "word" message arrives.
+      return;
+    }
+
+    if(msg.type==="greeting_done"){
+      finaliseStream(); playBufferedAudio();
+      setBadge("Waiting..."); modeEl.textContent="Starting STT"; return;
+    }
+
+    if(msg.type==="listening_ready"){
+      await startMic();
+      setBadge("Listening"); modeEl.textContent="Listening"; return;
+    }
+
+    if(msg.type==="transcription"){
+      addMsg("user",msg.text); return;
+    }
+
+    if(msg.type==="stop_audio"){
+      stopLocalAudio();
+      setBadge("Listening"); modeEl.textContent="Listening"; return;
+    }
+
+    if(msg.type==="clear_audio"){ audioBufferChunks=[]; return; }
+
+    if(msg.type==="audio_chunk"){
+      isAiSpeaking=true;
+      interruptSent=false;
+      if(msg.encoding==="pcm_f32"){ playStreamChunk(msg.audio); }
+      else { audioBufferChunks.push(msg.audio); }
+      return;
+    }
+
+    if(msg.type==="word"){
+      if(!activeBubble){ streamPhase=streamPhase||"response"; createStreamBubble(); setBadge("Speaking","speaking"); }
+      queueWord(msg.word, msg.index??(pendingWords.length+shownWordCount>0?1:0));
+      return;
+    }
+
+    if(msg.type==="complete"){
+      finaliseStream(); playBufferedAudio();
+      setBadge("Listening"); modeEl.textContent="Listening"; return;
+    }
+
+    if(msg.type==="session_ended"){
+      sessionEnded=true;   // playBufferedAudio's onended will see this and flip buttons
+      stopMic();
+      return;
+    }
+
+    if(msg.type==="error"){
+      setBadge("Error","error"); addMsg("error-msg",msg.message); return;
+    }
+  };
+
+  ws.onclose=()=>{
+    document.getElementById("conn").textContent="Disconnected";
+    setButtons(false,false,false);
+    stopMic(); stopVAD(); stopWordSync(); finaliseStream();
+    isAiSpeaking=false;
+    setTimeout(connect,2000);
+  };
+}
+
+/* ── Button handlers ─────────────────────────────────────────────────────────*/
+startBtn.onclick=async()=>{
+  initPlayContext();
+  if(playAudioContext.state==="suspended") await playAudioContext.resume();
+  ws.send(JSON.stringify({type:"start"}));
+  setBadge("Starting...","speaking"); modeEl.textContent="Greeting";
+  setButtons(false,true,true);
+};
+
+stopBtn.onclick=()=>{
+  ws.send(JSON.stringify({type:"stop"}));
+  stopMic(); stopWordSync(); finaliseStream();
+  isAiSpeaking=false;
+  setBadge("Stopped"); modeEl.textContent="Idle";
+  setButtons(true,false,true);
+};
+
+clearBtn.onclick=()=>{
+  chat.innerHTML=""; totalWords=0; wordCountEl.textContent="0";
+  activeBubble=null; streamPhase=null;
+};
+
+window.onload=connect;
+</script>
+</body>
+</html>
