@@ -13,12 +13,13 @@ logger.addHandler(logging.NullHandler())
 _DEFAULT_LOG_FILE = Path(__file__).parent.parent.parent / "voicestax.log"
 
 
+
 def setup_logging(
     level: str = "INFO",
     mode: str = "both",                  # "console" | "file" | "both"
     log_file: str | Path = _DEFAULT_LOG_FILE,
     max_bytes: int = 5 * 1024 * 1024,   # 5 MB
-    backup_count: int = 3,
+    backup_count: int = 3,#3 backup log files
 ) -> logging.Logger:
     """
     Call this once from your application entry point (e.g. main.py).
@@ -53,7 +54,7 @@ def setup_logging(
         _logger.addHandler(console_handler)
 
     if mode in ("file", "both"):
-        log_file = Path(log_file)
+        log_file = Path(log_file).resolve()
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
         file_handler = RotatingFileHandler(
@@ -64,10 +65,11 @@ def setup_logging(
         )
         file_handler.setFormatter(formatter)
         _logger.addHandler(file_handler)
+        _logger.info(f"Logging to: {log_file}")
 
     # ── Session start banner ─────────────────────────────────────────────────
     _logger.info("=" * 60)
-    _logger.info("  VoiceStax session started")
+    _logger.info("  VoiceStax logging initialized")
     _logger.info("=" * 60)
 
     return _logger

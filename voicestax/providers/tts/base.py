@@ -1,6 +1,5 @@
+# Implementation for the base TTS provider interface.
 from abc import ABC, abstractmethod
-
-
 class BaseTTSProvider(ABC):
 
     @abstractmethod

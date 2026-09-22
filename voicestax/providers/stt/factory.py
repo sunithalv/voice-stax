@@ -1,39 +1,25 @@
-# VoiceStax/providers/stt/factory.py
+# STT provider factory for creating speech-to-text implementations.
+# It registers supported providers and returns the appropriate provider instance.
 
-from typing import Any
 from voicestax.providers.stt.assemblyai import AssemblyAISTTProvider
-from voicestax.utils.exceptions import ProviderNotSupportedError, STTValidationError
+from voicestax.utils.exceptions import ProviderNotSupportedError
+
+STT_PROVIDER_REGISTRY = {
+    "assemblyai": AssemblyAISTTProvider,
+}
 
 
-def get_stt_provider(provider_name: str, **kwargs: Any):
-    """
-    Factory method to create STT providers dynamically.
+def get_stt_provider(provider_name: str,api_key:str, **kwargs):
 
-    Args:
-        provider_name: Name of the STT provider (assemblyai, google, whisper, etc.)
-        **kwargs: Provider-specific parameters
+    provider_class = STT_PROVIDER_REGISTRY.get(provider_name.lower())
 
-    Returns:
-        Instance of BaseSTTProvider
-    """
+    if provider_class is None:
+        raise ProviderNotSupportedError(
+            f"Unsupported STT provider: {provider_name}"
+        )
 
-    provider_name = provider_name.lower()
+    provider = provider_class(api_key=api_key,**kwargs)
 
-    if provider_name == "assemblyai":
-        # Remove unsupported param for AssemblyAI
-        kwargs.pop("model", None)
-        provider = AssemblyAISTTProvider(**kwargs)
-        if not provider.validate_api_key():
-            raise STTValidationError(f"Invalid API key for STT provider: {provider_name}")
-        return provider
+    provider.validate_api_key()
 
-    # Future providers can be added here
-    # elif provider_name == "google":
-    #     from .google import GoogleSTTProvider
-    #     return GoogleSTTProvider(**kwargs)
-
-    # elif provider_name == "whisper":
-    #     from .whisper import WhisperSTTProvider
-    #     return WhisperSTTProvider(**kwargs)
-
-    raise ProviderNotSupportedError(f"Unsupported STT provider: {provider_name}")
+    return provider

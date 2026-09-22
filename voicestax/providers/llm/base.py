@@ -1,5 +1,9 @@
-from abc import ABC, abstractmethod
+# Base interface for LLM providers.
+# This module defines the common contract that concrete language model providers
+# must implement for API key validation and chat streaming.
 
+from abc import ABC, abstractmethod
+from typing import Any,Iterator
 
 class BaseLLMProvider(ABC):
 
@@ -8,5 +12,5 @@ class BaseLLMProvider(ABC):
         pass
 
     @abstractmethod
-    def stream_chat(self, messages):
+    def stream_chat(self, messages: list[dict[str, str]]) -> Iterator[Any]:
         pass

@@ -1,3 +1,6 @@
+# Base interface for speech-to-text providers, defining the streaming
+# lifecycle and audio delivery methods that concrete providers must implement.
+
 from abc import ABC, abstractmethod
 from typing import Callable
 
@@ -5,8 +8,9 @@ from typing import Callable
 class BaseSTTProvider(ABC):
     
     @property
+    @abstractmethod
     def is_ready(self) -> bool:
-        return False
+        pass
 
     @abstractmethod
     def validate_api_key(self) -> bool:
@@ -17,11 +21,11 @@ class BaseSTTProvider(ABC):
         self,
         on_transcript: Callable[[str, bool], None],
         on_error: Callable[[Exception], None],
-    ):
+    )-> None:
         pass
 
     @abstractmethod
-    def stop_streaming(self):
+    def stop_streaming(self)-> None:
         pass
 
     @abstractmethod

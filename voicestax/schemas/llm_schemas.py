@@ -4,7 +4,12 @@ from pydantic import BaseModel, field_validator
 from typing import Literal
 
 class LLMResponse(BaseModel):
-    intent: Literal["continue", "end_session"] = "continue"
+    intent: Literal[
+        "conversation",
+        "clarification",
+        "end_conversation",
+        "human_handoff"
+    ] = "conversation"
     response: str
 
     @field_validator("response")

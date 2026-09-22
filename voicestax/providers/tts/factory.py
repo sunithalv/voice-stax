@@ -1,33 +1,26 @@
-from voicestax.config.settings import get_settings
+# Implementation for TTS provider factory and registry.
 from voicestax.providers.tts.elevenlabs import ElevenLabsTTSProvider
-from voicestax.utils.exceptions import ProviderNotSupportedError, TTSValidationError
+from voicestax.utils.exceptions import ProviderNotSupportedError
 
+TTS_PROVIDER_REGISTRY = {
+    "elevenlabs": ElevenLabsTTSProvider,
+}
 
-def get_tts_provider(
-    provider_name: str = None,
-    api_key: str = None,
-    voice_id: str = None,
-    model_id: str = None,
-    output_format: str = None,
-    optimize_latency: bool = None
-):
+# Factory function to get TTS provider instance
+def get_tts_provider(provider_name: str, api_key: str, **kwargs):
     """
     Factory for TTS providers.
     Parameters are optional; if not provided, fallback to settings.
     """
-    settings = get_settings()
-    provider_name = provider_name or settings.tts_provider
-    key = api_key or settings.tts_api_key
+    provider_class = TTS_PROVIDER_REGISTRY.get(provider_name.lower())
 
-    if provider_name == "elevenlabs":
-        provider = ElevenLabsTTSProvider(
-            api_key=key,
-            voice_id=voice_id,
-            model_id=model_id,
-            output_format=output_format ,
-            optimize_latency=optimize_latency ,
+    if provider_class is None:
+        raise ProviderNotSupportedError(
+            f"Unsupported TTS provider: {provider_name}"
         )
-        provider.validate_api_key()  # This will raise appropriate exceptions
-        return provider
 
-    raise ProviderNotSupportedError(f"Unsupported TTS provider: {provider_name}")
+    provider = provider_class(api_key=api_key, **kwargs)
+
+    provider.validate_api_key()
+
+    return provider

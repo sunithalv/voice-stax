@@ -1,168 +1,560 @@
 """
 Voice Agent Core Orchestration
 
-- Handles full voice pipeline: STT → LLM → TTS
-- Supports true barge-in: cancels in-flight TTS task immediately
-- Uses LLM intent detection
-- Delegates audio streaming to AudioManager
-- Tracks session state and conversation
+Responsibilities:
+- Orchestrates the full voice pipeline: STT -> LLM -> TTS.
+- Supports true barge-in by cancelling in-flight TTS.
+- Handles high-confidence local intents such as explicit goodbye.
+- Uses the LLM for context-dependent intent detection.
+- Delegates audio streaming to AudioManager.
+- Tracks session state and conversation lifecycle.
 """
 
 import asyncio
-import json
-import re
-
 from fastapi import WebSocket
-from voicestax.utils.logger import logger
 from voicestax.schemas.llm_schemas import LLMResponse
-from voicestax.session.voice_session import SessionData
 from voicestax.session.barge_in import BargeInManager
-from voicestax.config.settings import VoiceSettings, get_settings
-from typing import Optional
-from voicestax.utils.exceptions import SessionError, WebSocketError
+from voicestax.session.voice_session import SessionData
+from voicestax.utils.exceptions import (
+    SessionError,
+    TTSError,
+    WebSocketError,
+)
+from voicestax.utils.text_processing import detect_local_intent
+from voicestax.utils.logger import logger
 
 
 class VoiceAgent:
-    """Orchestrates a real-time voice session."""
+    """Orchestrates a real-time VoiceStax session."""
 
-    def __init__(self, session: SessionData, audio_manager, chat_engine,settings: Optional[VoiceSettings] = None):
-        self.settings = get_settings(override=settings)
+    DEFAULT_ERROR_RESPONSE = (
+        "Sorry, I encountered an error. Please try again."
+    )
+
+    DEFAULT_GOODBYE_RESPONSE = (
+        "Thank you for contacting us. Goodbye!"
+    )
+
+    DEFAULT_HANDOFF_RESPONSE = (
+        "I will connect you with a human agent."
+    )
+
+    def __init__(
+        self,
+        session: SessionData,
+        audio_manager,
+        chat_engine
+    ):
         self.session = session
         self.audio_manager = audio_manager
         self.chat_engine = chat_engine
-        self.barge_manager = BargeInManager(session)
 
-        # Validate session has required providers
-        if not self.session.llm_provider:
-            raise SessionError("Session must have LLM provider configured")
-        if not self.session.stt_provider:
-            raise SessionError("Session must have STT provider configured")
+        self._session_ended = False
 
-        # Track the currently running TTS asyncio Task so we can cancel it
-        # the instant a barge-in is detected — before acquiring any lock.
+        # The task currently streaming TTS audio.
+        #
+        # This task is intentionally not protected by the LLM processing lock.
+        # Barge-in must be able to cancel TTS immediately.
         self._tts_task: asyncio.Task | None = None
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Public entry point
-    # ─────────────────────────────────────────────────────────────────────────
+        self.barge_manager = BargeInManager(session)
 
-    async def handle_user_message(self, text: str, websocket: WebSocket):
+        # Validate that the session has the providers required for a voice turn.
+        if not self.session.stt_provider:
+                    raise SessionError(
+                        "Session must have STT provider configured"
+                    )
+        
+        if not self.session.llm_provider:
+            raise SessionError(
+                "Session must have LLM provider configured"
+            )
+
+        logger.debug(
+            "%s [VoiceAgent] Initialized",
+            self.session.log_prefix(),
+        )
+
+    @property
+    def session_ended(self) -> bool:
+        """Return whether the agent has requested session termination."""
+        return self._session_ended
+
+    def reset_session_ended(self) -> None:
+        """Reset the terminal flag when reusing the agent/session."""
+        self._session_ended = False
+
+        logger.debug(
+            "%s [VoiceAgent] Session-ended flag reset",
+            self.session.log_prefix(),
+        )
+
+    async def handle_user_message(
+        self,
+        text: str,
+        websocket: WebSocket,
+    ) -> None:
         """
-        Called for every final STT transcript.
+        Handle one final STT transcript.
 
-        Steps:
-          1. Immediately cancel any in-flight TTS (barge-in).
-          2. Acquire processing lock ONLY for the LLM call (not TTS).
-          3. Release lock, then stream TTS as a tracked Task.
-             This way the next barge-in can acquire the lock immediately.
+        Processing order:
+
+        1. Log the final user transcript.
+        2. Handle barge-in state and cancel active TTS if required.
+        3. Check high-confidence local intents.
+        4. Otherwise call the LLM under the processing lock.
+        5. Stream the response through TTS outside the lock.
+        6. Apply terminal actions such as ending the session or handoff.
         """
 
-        # ── STEP 1: Barge-in — cancel TTS BEFORE acquiring the lock ──────────
+        if not text or not text.strip():
+            logger.debug(
+                "%s [VoiceAgent] Ignoring empty user transcript",
+                self.session.log_prefix(),
+            )
+            return
+
+        text = text.strip()
+
+        logger.info(
+            "%s User: %s",
+            self.session.log_prefix(),
+            text[:100],
+        )
+
+        # ---------------------------------------------------------------
+        # STEP 1: Handle barge-in before acquiring the processing lock.
+        #
+        # TTS cancellation must remain independent of the LLM lock.
+        # Otherwise, a barge-in could wait for a slow LLM request to finish.
+        # ---------------------------------------------------------------
         interrupted = self.barge_manager.handle_user_input(text)
-        # Also cancel if VAD already fired but BargeInManager missed it
-        if not interrupted and self.session.was_interrupted:
+
+        if interrupted:
+            # Cancel the active TTS task and notify the frontend to clear audio.
+            await self._cancel_tts(websocket)
+        elif self.session.was_interrupted:
+            logger.debug(
+                "%s [VoiceAgent] Existing interruption flag detected; "
+                "cancelling active TTS",
+                self.session.log_prefix(),
+            )
             await self._cancel_tts(websocket)
             interrupted = True
-        
-        self.session.was_interrupted = False  # reset after handling
-        # ── STEP 2 & 3: Lock covers ONLY the LLM call ────────────────────────
-        # TTS is intentionally outside the lock so _cancel_tts can be called
-        # by a concurrent interrupt without deadlocking.
-        intent   = "continue"
-        response = "Sorry, I encountered an error."
+
+        self.session.was_interrupted = False
+
+        if interrupted:
+            logger.info(
+                "%s [VoiceAgent] Barge-in handled; "
+                "processing transcript as a new user turn",
+                self.session.log_prefix(),
+            )
+
+        # ---------------------------------------------------------------
+        # STEP 2: Handle high-confidence local intents.
+        #
+        # Explicit goodbye phrases and human handoff do not need an LLM call. This reduces
+        # latency and avoids relying on valid JSON for session termination.
+        #
+        # Ambiguous phrases such as "I am done" or "that's it" are not
+        # handled here; they are sent to the LLM because context matters.
+        # ---------------------------------------------------------------
+        local_intent = detect_local_intent(text)
+
+        if local_intent is not None:
+            logger.info(
+                "%s [VoiceAgent] Local intent detected: %s",
+                self.session.log_prefix(),
+                local_intent,
+            )
+            
+            # Goodbye phrases detected in user text
+            if local_intent == "end_conversation":
+                await self._handle_terminal_response(
+                    websocket=websocket,
+                    intent="end_conversation",
+                    response=self.DEFAULT_GOODBYE_RESPONSE,
+                )
+                return
+
+            # Human handoff phrases detected in user text
+            if local_intent == "human_handoff":
+                await self._handle_terminal_response(
+                    websocket=websocket,
+                    intent="human_handoff",
+                    response=self.DEFAULT_HANDOFF_RESPONSE,
+                )
+                return
+
+        # ---------------------------------------------------------------
+        # STEP 3: Call the LLM.
+        #
+        # The processing lock protects the LLM turn only.
+        # TTS is deliberately executed after releasing this lock.
+        # ---------------------------------------------------------------
+        intent = "conversation"
+        response = self.DEFAULT_ERROR_RESPONSE
+        llm_succeeded = False
 
         async with self.session.processing_lock:
             self.session.set_state("processing")
-            # Clear cancel so this fresh response streams without being
-            # immediately aborted by a stale cancel_event from the previous turn.
+
+            # Clear cancellation from the previous turn before starting
+            # a fresh LLM/TTS response.
             self.session.cancel_event.clear()
 
             try:
-                raw_result = await self.chat_engine.get_intent_and_response(
-                    user_text=text,
-                    session=self.session,
+                result: LLMResponse = await asyncio.wait_for(
+                    self.chat_engine.get_intent_and_response(
+                        user_text=text,
+                        session=self.session,
+                    ),
+                    timeout=self.session.settings.llm_timeout_seconds,
                 )
-                logger.debug(f"💬 LLM raw result: {raw_result}")
 
-                if isinstance(raw_result, str):
-                    match = re.search(r'\{.*\}', raw_result, re.DOTALL)
-                    raw_result = json.loads(match.group()) if match else {}
+                logger.debug(
+                    "%s [VoiceAgent] LLM result received: intent=%s",
+                    self.session.log_prefix(),
+                    result.intent,
+                )
 
-                validated = LLMResponse(**raw_result)
-                intent    = validated.intent
-                response  = validated.response
+                intent = result.intent
+                response = result.response
+                llm_succeeded = True
 
-            except Exception as e:
-                logger.error(f"[LLM ERROR]: {e}")
-                # intent/response already set to safe defaults above
+                logger.info(
+                    "%s [VoiceAgent] Intent=%s",
+                    self.session.log_prefix(),
+                    intent,
+                )
 
-        # ── STEP 4: TTS — runs OUTSIDE the lock ──────────────────────────────
-        self.session.ignore_barge_in_once = False
+            except asyncio.TimeoutError:
+                logger.error(
+                    "%s [VoiceAgent] LLM request timed out after %.2f seconds",
+                    self.session.log_prefix(),
+                    self.session.settings.llm_timeout_seconds,
+                )
 
-        if intent == "end_session":
-            self.session.set_state("speaking")
-            await self._stream_and_track(websocket, response)
-            try:
-                await websocket.send_json({"type": "status", "text": "Session ended"})
-            except Exception as e:
-                raise WebSocketError(f"Failed to send session ended status: {e}") from e
-            if self.session.stt_provider:
-                self.session.stt_provider.stop_streaming()
-            self.session.set_state("idle")
-            self.session.reset_session()
+            except Exception as exc:
+                logger.error(
+                    "%s [VoiceAgent] LLM request failed: %s: %s",
+                    self.session.log_prefix(),
+                    type(exc).__name__,
+                    exc,
+                )
+
+        # ---------------------------------------------------------------
+        # STEP 4: Do not continue with TTS if the current turn was
+        # interrupted while the LLM was processing.
+        # ---------------------------------------------------------------
+        if self.session.cancel_event.is_set():
+            logger.info(
+                "%s [VoiceAgent] Skipping TTS because the turn was cancelled",
+                self.session.log_prefix(),
+            )
             return
 
+        # Send the assistant text to the frontend before audio streaming.
+        try:
+            await websocket.send_json(
+                {
+                    "type": "transcript",
+                    "speaker": "assistant",
+                    "text": response,
+                }
+            )
+        except Exception as exc:
+            raise WebSocketError(
+                f"Failed to send assistant transcript: {exc}"
+            ) from exc
+
+        if not llm_succeeded:
+            logger.warning(
+                "%s [VoiceAgent] Sending fallback response after LLM failure",
+                self.session.log_prefix(),
+            )
+
+        # ---------------------------------------------------------------
+        # STEP 5: Apply intent-specific behavior.
+        # ---------------------------------------------------------------
+        if intent == "end_conversation":
+            await self._handle_terminal_response(
+                websocket=websocket,
+                intent="end_conversation",
+                response=response,
+                transcript_already_sent=True,
+            )
+            return
+
+        if intent == "human_handoff":
+            await self._handle_terminal_response(
+                websocket=websocket,
+                intent="human_handoff",
+                response=response,
+                transcript_already_sent=True,
+            )
+            return
+
+        # ---------------------------------------------------------------
+        # STEP 6: Normal conversational TTS.
+        # ---------------------------------------------------------------
         self.session.set_state("speaking")
-        await self._stream_and_track(websocket, response)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Helpers
-    # ─────────────────────────────────────────────────────────────────────────
+        logger.debug(
+            "%s [VoiceAgent] Starting normal TTS response",
+            self.session.log_prefix(),
+        )
 
-    async def _stream_and_track(self, websocket: WebSocket, text: str):
+        await self._stream_and_track(
+            websocket=websocket,
+            text=response,
+        )
+
+        self.session.set_state("listening")
+
+        logger.debug(
+            "%s [VoiceAgent] Normal response completed",
+            self.session.log_prefix(),
+        )
+
+    async def _handle_terminal_response(
+        self,
+        websocket: WebSocket,
+        intent: str,
+        response: str,
+        transcript_already_sent: bool = False,
+    ) -> None:
+
+        # Local intents have not sent the assistant transcript yet.
+        # LLM-generated terminal responses are already sent by handle_user_message(),
+        # so their transcript is skipped here to avoid sending it twice.
+        if not transcript_already_sent:
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "transcript",
+                        "speaker": "assistant",
+                        "text": response,
+                    }
+                )
+            except Exception as exc:
+                raise WebSocketError(
+                    f"Failed to send terminal assistant transcript: {exc}"
+                ) from exc
+        
+        #After response is sent to frontend the state is in assistant speaking mode
+        self.session.set_state("speaking")
+
+        logger.info(
+            "%s [VoiceAgent] Speaking terminal response: intent=%s",
+            self.session.log_prefix(),
+            intent,
+        )
+
+        await self._stream_and_track(
+            websocket=websocket,
+            text=response,
+        )
+
+        if intent == "end_conversation":
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "session_ended",
+                    }
+                )
+            except Exception as exc:
+                raise WebSocketError(
+                    f"Failed to send session-ended status: {exc}"
+                ) from exc
+
+            logger.info(
+                "%s [VoiceAgent] Conversation ended",
+                self.session.log_prefix(),
+            )
+
+        elif intent == "human_handoff":
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "human_handoff",
+                    }
+                )
+            except Exception as exc:
+                raise WebSocketError(
+                    f"Failed to send human-handoff event: {exc}"
+                ) from exc
+
+            logger.info(
+                "%s [VoiceAgent] Human handoff requested",
+                self.session.log_prefix(),
+            )
+
+        self._session_ended = True
+
+    async def _stream_and_track(
+        self,
+        websocket: WebSocket,
+        text: str,
+    ) -> None:
         """
-        Run stream_text as a tracked asyncio Task stored in self._tts_task.
-        The lock is held only for LLM; TTS runs outside it so barge-in can
-        cancel without deadlocking.
+        Stream TTS through a tracked asyncio task.
+
+        The tracked task can be cancelled immediately by _cancel_tts()
+        when barge-in is detected.
         """
-        self._tts_task = asyncio.create_task(
+
+        tts_task = asyncio.create_task(
             self.audio_manager.stream_text(
                 websocket=websocket,
                 text=text,
                 session=self.session,
             )
         )
+
+        self._tts_task = tts_task
+
+        logger.debug(
+            "%s [VoiceAgent] TTS task started",
+            self.session.log_prefix(),
+        )
+
         try:
-            await self._tts_task
+            await tts_task
+
         except asyncio.CancelledError:
-            pass  # barge-in cancelled it — that's expected
+            logger.info(
+                "%s [VoiceAgent] TTS task cancelled",
+                self.session.log_prefix(),
+            )
+
+        except TTSError as exc:
+            logger.error(
+                "%s [VoiceAgent] TTS failed: %s",
+                self.session.log_prefix(),
+                exc,
+            )
+
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "tts_error",
+                        "message": (
+                            "I'm sorry, I'm having trouble speaking "
+                            "right now. Please try again."
+                        ),
+                        "response_id": self.session.current_response_id,
+                    }
+                )
+            except Exception as send_exc:
+                logger.warning(
+                    "%s [VoiceAgent] Failed to send TTS error event: %s",
+                    self.session.log_prefix(),
+                    send_exc,
+                )
+
         finally:
+            # Clear only if this is still the currently tracked task.
+            #
+            # This prevents an older task from clearing a newer task
+            # reference during a cancellation race.
+            if self._tts_task is tts_task:
+                self._tts_task = None
+
+            logger.debug(
+                "%s [VoiceAgent] TTS task finished",
+                self.session.log_prefix(),
+            )
+
+    async def _cancel_tts(
+        self,
+        websocket: WebSocket,
+        send_stop_audio: bool = True,
+    ) -> None:
+        """
+        Cancel active TTS immediately during barge-in.
+
+        Steps:
+        1. Mark the session as interrupted.
+        2. Cancel the currently tracked TTS task.
+        3. Wait briefly for task cleanup.
+        4. Ask the frontend to clear buffered audio.
+        """
+
+        logger.info(
+            "%s [VoiceAgent] Barge-in detected; cancelling TTS",
+            self.session.log_prefix(),
+        )
+
+        # Signal cancellation to AudioManager and any other active pipeline
+        # component that checks the session interruption state.
+        self.session.trigger_barge_in()
+
+        current_tts_task = self._tts_task
+        
+        # Check if there is an active TTS task and if so cancel it
+        if current_tts_task is not None and not current_tts_task.done():
+            logger.debug(
+                "%s [VoiceAgent] Cancelling active TTS task",
+                self.session.log_prefix(),
+            )
+
+            current_tts_task.cancel()
+
+            try:
+                # Wait briefly for cancelled task to actually finish 
+                await asyncio.wait_for(
+                    asyncio.shield(current_tts_task),
+                    timeout=0.5,
+                )
+
+            except asyncio.CancelledError:
+                logger.debug(
+                    "%s [VoiceAgent] TTS cancellation acknowledged",
+                    self.session.log_prefix(),
+                )
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "%s [VoiceAgent] TTS task did not finish within "
+                    "cancellation timeout",
+                    self.session.log_prefix(),
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "%s [VoiceAgent] Error while cancelling TTS task: %s",
+                    self.session.log_prefix(),
+                    exc,
+                )
+
+        # Verify the task instance and clear it.
+        if self._tts_task is current_tts_task:
             self._tts_task = None
 
-    async def _cancel_tts(self, websocket: WebSocket, send_stop_audio=True):
-        """
-        Immediately stop any in-flight TTS:
-          1. Set the session cancel flag (stops chunk loop in AudioManager).
-          2. Cancel the asyncio Task (unblocks any awaiting sleep/queue).
-          3. Tell the frontend to stop audio playback right now.
-        """
-        self.session.was_interrupted = True
-        self.session.is_speaking = False
-        self.session.cancel_event.set()
-
-        if self._tts_task and not self._tts_task.done():
-            self._tts_task.cancel()
+        # Immediately stop playback and clear browser-side audio buffers.
+        if send_stop_audio:
             try:
-                await asyncio.wait_for(self._tts_task, timeout=0.5)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
+                await websocket.send_json(
+                    {
+                        "type": "clear_audio",
+                    }
+                )
 
-        self._tts_task = None
+                logger.info(
+                    "%s [VoiceAgent] Sent clear_audio to frontend",
+                    self.session.log_prefix(),
+                )
 
-        # Tell the frontend: stop audio, discard buffers, reset UI
-        if send_stop_audio:                          # ← conditional
-            try:
-                await websocket.send_json({"type": "stop_audio"})
-            except Exception as e:
-                raise WebSocketError(f"Failed to send stop_audio message: {e}") from e
-        logger.info("[BARGE-IN] TTS cancelled, stop_audio sent to frontend")
+            except Exception as exc:
+                logger.warning(
+                    "%s [VoiceAgent] Failed to send clear_audio: %s",
+                    self.session.log_prefix(),
+                    exc,
+                )
+
+        logger.info(
+            "%s [VoiceAgent] TTS cancellation complete",
+            self.session.log_prefix(),
+        )
