@@ -4,6 +4,16 @@ version = "0.1.0"
 description = "A modular voice assistant framework with support for TTS, STT, and LLM providers, enabling conversational AI."
 readme = "README.md"
 requires-python = ">=3.12"
+authors = [
+    { name = "Sunitha L V", email = "sunithalv05@gmail.com" }
+]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "assemblyai==0.50.0",
     "elevenlabs==2.31.0",
