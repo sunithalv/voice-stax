@@ -607,44 +607,33 @@ A sample RAG integration is included separately from the core framework.
 # Project Structure
 
 ```text
+## Project Structure
+
 voice-stax/
 │
-├── voicestax/
-│   │
-│   ├── api/
-│   │   ├── app.py
-│   │   └── websocket_routes.py
-│   │
-│   ├── config/
-│   │   └── settings.py
-│   │
-│   ├── core/
-│   │   ├── voice_agent.py
-│   │   ├── chat_engine.py
-│   │   ├── audio_manager.py
-│   │   └── vad_manager.py
-│   │
-│   ├── providers/
-│   │   ├── stt/
-│   │   ├── tts/
-│   │   ├── llm/
-│   │   └── vad/
-│   │
-│   ├── session/
-│   │
-│   └── utils/
+├── voicestax/                    # Core VoiceStax framework
+│   ├── api/                      # FastAPI application and WebSocket interface
+│   ├── cli/                      # Command-line interface
+│   ├── config/                   # Framework configuration and settings
+│   ├── core/                     # Voice-agent orchestration and audio pipeline
+│   ├── providers/                # STT, TTS, LLM, and VAD provider implementations
+│   ├── schemas/                  # Structured LLM response schemas
+│   ├── session/                  # Voice session state and barge-in handling
+│   └── utils/                    # Logging, exceptions, and text-processing utilities
 │
-├── examples/
+├── examples/                     # Example client/application code
+│   └── html/                     # Browser-based voice chat interface
 │
-├── sample_providers/
-│   └── rag/
+├── sample_providers/             # Example application-level integrations
+│   └── rag/                      # Example RAG integration with VoiceStax
 │
-├── main.py
-├── main_rag.py
-├── pyproject.toml
-├── LICENSE
-├── NOTICE
-└── README.md
+├── tests/                        # VoiceStax test suite
+│
+├── main.py                       # Basic browser-based VoiceStax example
+├── pyproject.toml                # Package metadata and dependencies
+├── LICENSE                       # Apache License 2.0
+├── NOTICE                        # Project copyright notice
+└── README.md                     # Project documentation
 ```
 
 ---
