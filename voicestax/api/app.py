@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from typing import Optional
 
 from voicestax.config.settings import VoiceSettings, get_settings
-from voicestax import __version__
+from voicestax._version import __version__
 from voicestax.utils.logger import logger
 
 
