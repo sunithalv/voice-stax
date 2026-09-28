@@ -70,10 +70,15 @@ app = create_voice_app()
 
 You can then run the FastAPI application using your normal ASGI server setup.
 
-For example:
+For example, using Uvicorn:
 
 ```bash
 uvicorn main:app --reload
+```
+Alternatively, if main.py contains the Uvicorn startup code, you can run:
+
+```bash
+python main.py
 ```
 
 where `main.py` contains the application code above.
