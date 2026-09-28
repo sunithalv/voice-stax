@@ -3,31 +3,25 @@
 # validating, and retrieving provider configuration values such as API keys.
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, ValidationError, field_validator
-from typing import Optional, Dict,Any
+from pydantic import Field, field_validator
+from typing import Any, Dict, Optional
 from voicestax.utils.exceptions import ConfigurationError
-
-JSON_STRUCTURE_SUFFIX = (
-    "\n\nYour ENTIRE response must be ONLY a valid JSON object — "
-    "no explanation, no markdown. "
-    'Format: {"intent":"conversation|clarification|end_conversation|human_handoff",'
-    '"response":"your reply"}'
-)
 
 SUPPORTED_LANGUAGES = {"en", "hi", "ml"}
 
 
 class VoiceSettings(BaseSettings):
-    """Configuration for VoiceStax voice agent"""
-    
+
     app_name: str = "VoiceStax"
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore"
+        extra="ignore",
     )
+
+    # VoiceStax application configuration
     log_level: str = "DEBUG"
     enable_metrics: bool = True
 
@@ -35,9 +29,13 @@ class VoiceSettings(BaseSettings):
     first_speaker: str = "assistant"
     initial_message: str = "Hello! I am your AI assistant."
     language: str = "en"
-    telephony_language: Optional[str] = None
-    
-    # Provider configurations
+
+    # API keys — loaded from .env
+    stt_api_key: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    tts_api_key: Optional[str] = None
+
+    # Provider selection
     stt_provider: str = "assemblyai"
     stt_config: Dict[str, Any] = Field(default_factory=dict)
 
@@ -47,39 +45,13 @@ class VoiceSettings(BaseSettings):
     tts_provider: str = "elevenlabs"
     tts_config: Dict[str, Any] = Field(default_factory=dict)
 
-    # API Keys
-    stt_api_key: Optional[str] = None
-    llm_api_key: Optional[str] = None
-    tts_api_key: Optional[str] = None
-
-    # Backward compatibility
-    api_keys: Dict[str, Optional[str]] = Field(default_factory=dict)
-    session_timeout_seconds: int = 1800
-    
-    #VAD configuration
-    vad_provider:str = "webrtc"
+    vad_provider: str = "webrtc"
     vad_config: Dict[str, Any] = Field(default_factory=dict)
-    
-    # VoiceStax pipeline config
+
+    # VoiceStax pipeline configuration
     vad_silence_threshold_ms: int = 300
-    vad_max_utterance_ms: int = 20000
+    vad_max_utterance_ms: int = 20_000
 
-    # STT
-    # stt_model: str = "default"
-    # stt_sample_rate: int = 16000
-    # stt_encoding: str = "pcm_s16le"
-
-    # TTS
-    # tts_model: str = "eleven_turbo_v2_5"
-    # tts_output_format: str = "pcm_24000"   
-    # tts_sample_rate: int = 24000
-    # tts_optimize_latency: int = 3          
-    # tts_voice_id: str = "EXAVITQu4vr4xnSDxMaL"
-
-    # LLM
-    # llm_model: str = "openai/gpt-oss-20b"
-    # llm_max_tokens: int = 120
-    
     llm_system_prompt: str = Field(
         default=(
             "You are a real-time voice assistant. "
@@ -88,8 +60,12 @@ class VoiceSettings(BaseSettings):
             'Format: {"intent": "conversation|clarification|end_conversation|human_handoff", '
             '"response": "your reply in 1-2 short conversational sentences"}'
         ),
-        description="Override via LLM_SYSTEM_PROMPT in .env to customise assistant behaviour"
+        description=(
+            "Core VoiceStax system prompt defining conversational behavior "
+            "and the structured LLM response format."
+        ),
     )
+
     llm_timeout_seconds: int = 20
 
     
@@ -105,21 +81,9 @@ class VoiceSettings(BaseSettings):
         return v
 
     
-    #Validate llm prompt to ensure it ends with the required JSON structure
-    @field_validator("llm_system_prompt")
-    @classmethod
-    def append_json_structure(cls, v: str) -> str:
-        # Avoid double-appending if already present
-        if JSON_STRUCTURE_SUFFIX.strip() not in v:
-            return v + JSON_STRUCTURE_SUFFIX
-        return v
-    
     # Get API keys for the selected providers
     def get_api_key(self, provider: str) -> Optional[str]:
-        key = getattr(self, f"{provider}_api_key", None)
-        if key:
-            return key
-        return self.api_keys.get(provider)
+        return getattr(self, f"{provider}_api_key", None)
 
     # Validate that all required API keys are present for the selected providers
     def validate_providers(self):
