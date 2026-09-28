@@ -26,31 +26,22 @@ VoiceStax manages **the real-time voice conversation around that intelligence**.
 
 # Quick Start
 
-The fastest way to try VoiceStax is to run the included browser-based example.
+The normal way to use VoiceStax is to install it from PyPI and integrate it into your own Python application.
 
 ## Requirements
 
 * Python 3.12+
 * API keys for the configured providers
 
-## 1. Install
-
-Clone the repository:
+## 1. Install VoiceStax
 
 ```bash
-git clone <repository-url>
-cd voice-stax
-```
-
-Install VoiceStax and its dependencies:
-
-```bash
-pip install -e .
+pip install voicestax
 ```
 
 ## 2. Configure API Keys
 
-Create a `.env` file in the project root:
+Create a `.env` file in your application project:
 
 ```text
 ASSEMBLYAI_API_KEY=your_assemblyai_key
@@ -58,7 +49,7 @@ ELEVENLABS_API_KEY=your_elevenlabs_key
 GROQ_API_KEY=your_groq_key
 ```
 
-The default VoiceStax providers are currently:
+The current default providers are:
 
 | Capability | Default provider |
 | ---------- | ---------------- |
@@ -67,17 +58,59 @@ The default VoiceStax providers are currently:
 | LLM        | Groq             |
 | VAD        | WebRTC VAD       |
 
-## 3. Run the Example
+## 3. Create a VoiceStax Application
 
-Start the example application:
+The simplest application can use the framework defaults:
 
-```bash
-python main.py
+```python
+from voicestax import create_voice_app
+
+app = create_voice_app()
 ```
 
-Then open the browser client included with the project and start speaking.
+You can then run the FastAPI application using your normal ASGI server setup.
 
-The example exercises the complete VoiceStax pipeline:
+For example:
+
+```bash
+uvicorn main:app --reload
+```
+
+where `main.py` contains the application code above.
+
+This is the quickest way to start using VoiceStax without configuring individual providers.
+
+> **Repository example:** The browser-based example application is maintained in the VoiceStax source repository. If you want to run that example directly, see [Running the Browser Example](#running-the-browser-example).
+
+---
+
+# Running the Browser Example
+
+VoiceStax includes a browser-based example for testing the real-time WebSocket voice pipeline.
+
+The example is useful for verifying:
+
+* Microphone audio capture
+* WebSocket communication
+* VAD and turn detection
+* Streaming STT
+* LLM processing
+* Streaming TTS
+* Conversation state
+* Barge-in and interruption handling
+* Runtime logging
+
+Because the example application and browser client are part of the repository rather than the core PyPI package, clone the repository when you want to run or modify the example:
+
+```bash
+git clone <repository-url>
+cd voice-stax
+pip install -e .
+```
+
+Then configure the required API keys and start the example according to the repository's application entry point.
+
+The browser example exercises the complete pipeline:
 
 ```text
 Microphone
@@ -110,13 +143,13 @@ Streaming Audio
 Browser
 ```
 
-This is the quickest way to verify that the VoiceStax pipeline is working.
+The repository is only required when you want to run or modify the example, inspect the source, contribute to VoiceStax, or develop the framework itself.
 
 ---
 
 # Using VoiceStax
 
-VoiceStax is designed to support different levels of integration.
+VoiceStax supports different levels of configuration.
 
 You can start with the framework defaults and introduce more control only when your application requires it.
 
@@ -210,7 +243,6 @@ Provider-specific parameters can be supplied through the corresponding configura
 from voicestax import create_voice_app, VoiceSettings
 
 settings = VoiceSettings(
-
     stt_provider="assemblyai",
     stt_config={
         "sample_rate": 16000,
@@ -348,19 +380,19 @@ VoiceStax adds the real-time voice layer around that application.
 
 It handles:
 
-* 🎙️ Real-time audio input
-* 📝 Speech-to-text
-* 🔊 Voice activity detection
-* ⏱️ Turn and utterance management
-* 🧠 LLM orchestration
-* 💬 Conversation and session management
-* 🔈 Text-to-speech
-* ⚡ Streaming audio
-* 🛑 Barge-in and interruption handling
-* 🔌 Provider abstraction
-* ⚙️ Configurable provider settings
-* 📋 Structured LLM responses
-* 🪵 Logging and runtime diagnostics
+* Real-time audio input
+* Speech-to-text
+* Voice activity detection
+* Turn and utterance management
+* LLM orchestration
+* Conversation and session management
+* Text-to-speech
+* Streaming audio
+* Barge-in and interruption handling
+* Provider abstraction
+* Configurable provider settings
+* Structured LLM responses
+* Logging and runtime diagnostics
 
 The goal is to allow an application developer to focus on **what the agent should know and do**, while VoiceStax manages the infrastructure required for a real-time voice conversation.
 
@@ -371,7 +403,7 @@ The goal is to allow an application developer to focus on **what the agent shoul
 At a high level, VoiceStax sits between the application and the real-time voice interface.
 
 ```text
-                  Your Application
+                 Your Application
 
         ┌─────────────────────────────────┐
         │                                 │
@@ -379,8 +411,8 @@ At a high level, VoiceStax sits between the application and the real-time voice 
         │  Business Logic                 │
         │  Database Context               │
         │  Tools / APIs                   │
-        │  Domain Instructions             │
-        │  Application LLM Logic           │
+        │  Domain Instructions            │
+        │  Application LLM Logic          │
         │                                 │
         └───────────────┬─────────────────┘
                         │
@@ -403,7 +435,7 @@ At a high level, VoiceStax sits between the application and the real-time voice 
         └───────────────┬─────────────────┘
                         │
                         ▼
-                      LLM
+                       LLM
                         │
                         ▼
                        TTS
@@ -643,6 +675,8 @@ Current default implementations include:
 
 The provider architecture allows alternative implementations to be added without changing the core voice-agent pipeline.
 
+Provider implementations accept provider-specific configuration through the corresponding configuration fields, keeping provider concerns separate from the core orchestration layer.
+
 ---
 
 # Configurable Providers
@@ -653,7 +687,6 @@ For example:
 
 ```python
 settings = VoiceSettings(
-
     stt_provider="assemblyai",
     stt_config={
         "sample_rate": 16000,
@@ -778,7 +811,9 @@ The exact response schema can evolve as VoiceStax's conversational capabilities 
 
 VoiceStax is designed for streaming interaction rather than request/response voice processing.
 
-The browser or other audio client sends audio to the server through a WebSocket connection.
+The current implementation uses a WebSocket-based real-time communication model.
+
+The client sends audio to the server, while VoiceStax processes the audio and returns events and audio as the conversation progresses.
 
 ```text
 Client
@@ -816,11 +851,13 @@ VAD
        TTS
         │
         ▼
-   Streaming audio
+  Streaming audio
         │
         ▼
       Client
 ```
+
+The WebSocket transport is deliberately kept separate from the core provider interfaces so that additional transports can be introduced as the framework evolves.
 
 ---
 
@@ -851,7 +888,7 @@ Cancel current TTS / audio
 Switch back to listening
 ```
 
-This prevents the assistant from continuing to speak over the user.
+This prevents the assistant from continuing to speak over the user and allows the conversation to return to the listening state.
 
 ---
 
@@ -913,7 +950,7 @@ User:
 VoiceStax transcript
         │
         ▼
-Application RAG
+   Application RAG
         │
         ├── Product manual
         ├── FAQ
@@ -932,7 +969,7 @@ Voice response
        TTS
 ```
 
-A sample RAG integration is included separately from the core framework.
+A sample RAG integration is maintained separately from the core framework.
 
 ---
 
@@ -993,6 +1030,8 @@ The application can then extend this with its own:
 ---
 
 # Project Structure
+
+The repository currently contains the framework source, examples, tests and development resources.
 
 ```text
 voice-stax/
@@ -1062,7 +1101,7 @@ New providers, transports and application integrations can be added without rede
 
 ## v0.1
 
-The initial release focuses on a stable browser-based real-time voice-agent pipeline.
+The initial release focuses on a browser-based real-time voice-agent pipeline.
 
 Current areas include:
 
@@ -1078,9 +1117,10 @@ Current areas include:
 * Barge-in/interruption handling
 * Configurable providers
 * Logging
+* Exception handling
+* Provider validation
 * Custom application LLM logic
 * Optional RAG example
-* Provider validation
 * Runtime testing and reliability
 
 The v0.1 release establishes the core VoiceStax architecture before expanding the framework to additional transports and capabilities.
@@ -1194,13 +1234,21 @@ The intention is to make it possible to take an existing AI application and add 
 
 # Development
 
-VoiceStax currently targets:
+VoiceStax is developed as an installable Python package.
 
-```text
-Python >= 3.12
+The normal installation path for users is:
+
+```bash
+pip install voicestax
 ```
 
-The project is being developed as an installable Python package with a provider-oriented architecture.
+If you want to contribute to VoiceStax, inspect the source code, modify the framework, or work on the included examples, clone the repository and install it in editable mode:
+
+```bash
+git clone <repository-url>
+cd voice-stax
+pip install -e .
+```
 
 During development, the browser-based voice pipeline is used to test:
 
