@@ -33,6 +33,7 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
     def __init__(
         self,
         api_key: str,
+        log_prefix: str,
         **kwargs: Any,
     ):
         """Initialize the ElevenLabs TTS provider.
@@ -47,6 +48,8 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
             raise TTSValidationError(
                 "ElevenLabs API key is required"
             )
+            
+        self.log_prefix = log_prefix
 
         # Provider defaults can be overridden by values supplied through
         # VoiceSettings.tts_config.
@@ -73,9 +76,10 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
         self.client = ElevenLabs(api_key=api_key)
 
         logger.debug(
-            "ElevenLabs TTS provider initialized. "
+            "%s [ElevenLabs] ElevenLabs TTS provider initialized. "
             "voice_id=%s, model_id=%s, output_format=%s, "
             "optimize_latency=%s, extra_config_keys=%s",
+            self.log_prefix,
             self.voice_id,
             self.model_id,
             self.output_format,
@@ -90,7 +94,8 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
 
         if not voice_id:
             logger.error(
-                "ElevenLabs voice ID is required"
+                "%s [ElevenLabs] ElevenLabs voice ID is required",
+                self.log_prefix,
             )
             raise TTSValidationError(
                 "ElevenLabs voice_id is required"
@@ -100,8 +105,10 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
 
         if not model_id:
             logger.error(
-                "ElevenLabs model ID is required"
+                "%s [ElevenLabs] ElevenLabs model ID is required",
+                self.log_prefix,
             )
+            
             raise TTSValidationError(
                 "ElevenLabs model_id is required"
             )
@@ -110,7 +117,8 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
 
         if not output_format:
             logger.error(
-                "ElevenLabs output format is required"
+                "%s [ElevenLabs] ElevenLabs output format is required",
+                self.log_prefix,
             )
             raise TTSValidationError(
                 "ElevenLabs output_format is required"
@@ -124,7 +132,8 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
             or not 0 <= optimize_latency <= 4
         ):
             logger.error(
-                "Invalid ElevenLabs optimize_latency: %s",
+                "%s [ElevenLabs] Invalid ElevenLabs optimize_latency: %s",
+                self.log_prefix,
                 optimize_latency,
             )
             raise TTSValidationError(
@@ -138,14 +147,14 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
         try:
             logger.debug(
                 "%s [ElevenLabs] Validating API key",
-                self._get_log_prefix(),
+                self.log_prefix,
             )
 
             self.client.voices.get_all()
 
             logger.info(
                 "%s [ElevenLabs] API key validation successful",
-                self._get_log_prefix(),
+                self.log_prefix,
             )
 
             return True
@@ -153,7 +162,7 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
         except requests.exceptions.ConnectionError as e:
             logger.error(
                 "%s [ElevenLabs] API connection failed during validation: %s",
-                self._get_log_prefix(),
+                self.log_prefix,
                 e,
             )
             raise TTSConnectionError(
@@ -163,7 +172,7 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
         except Exception as e:
             logger.error(
                 "%s [ElevenLabs] API validation failed: %s",
-                self._get_log_prefix(),
+                self.log_prefix,
                 e,
             )
             raise TTSValidationError(
@@ -180,7 +189,7 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
         logger.info(
             "%s [ElevenLabs] Generating speech "
             "(voice=%s, model=%s, format=%s, chars=%d)",
-            self._get_log_prefix(),
+            self.log_prefix,
             self.voice_id,
             self.model_id,
             self.output_format,
@@ -201,12 +210,25 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
 
             params.update(self.extra_config)
 
-            return self.client.text_to_speech.convert(**params)
+            logger.debug(
+                "%s [ElevenLabs] Calling text_to_speech.convert()",
+                self.log_prefix,
+            )
+
+            response = self.client.text_to_speech.convert(**params)
+
+            logger.debug(
+                "%s [ElevenLabs] text_to_speech.convert() returned response type=%s",
+                self.log_prefix,
+                type(response),
+            )
+
+            return response
 
         except requests.exceptions.ConnectionError as e:
             logger.error(
                 "%s [ElevenLabs] Connection failed during TTS: %s",
-                self._get_log_prefix(),
+                self.log_prefix,
                 e,
             )
             raise TTSConnectionError(
@@ -216,7 +238,7 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
         except Exception as e:
             logger.error(
                 "%s [ElevenLabs] TTS streaming failed: %s",
-                self._get_log_prefix(),
+                self.log_prefix,
                 e,
             )
             raise TTSStreamingError(

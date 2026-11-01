@@ -7,10 +7,10 @@ from voicestax import create_voice_app, VoiceSettings
 
 
 settings = VoiceSettings(
-    llm_system_prompt="You are a voice assistant named {settings.app_name}.",
+    app_name="VoiceStax",
     first_speaker="assistant",
     initial_message=(
-        "Hello! I am {settings.app_name} your AI Assistant. "
+        f"Hello! I am VoiceStax your AI Assistant. "
         "How can I help?"
     ),
 )

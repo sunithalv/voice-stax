@@ -30,6 +30,13 @@
     justify-content:flex-start;
 }
 
+.message-time {
+    font-size: 10px;
+    opacity: 0.6;
+    margin-top: 4px;
+    text-align: right;
+}
+
 .avatar{
     width:32px;
     height:32px;
@@ -53,12 +60,49 @@
     border-radius:12px;
     max-width:70%;
 }
-  .user{background:#3d7fff22;align-self:flex-end}
-  .ai{background:#00e5a022;align-self:flex-start}
-  .controls{padding:15px;border-top:1px solid var(--border);display:flex;gap:10px}
-  button{flex:1;padding:10px;border:none;border-radius:8px;cursor:pointer}
-  .start{background:var(--green)}
-  .stop{background:#ff3d3d;color:white}
+.user{background:#3d7fff22;align-self:flex-end}
+.ai{background:#00e5a022;align-self:flex-start}
+.controls{padding:15px;border-top:1px solid var(--border);display:flex;gap:10px}
+button{flex:1;padding:10px;border:none;border-radius:8px;cursor:pointer}
+.start{background:var(--green)}
+.stop{background:#ff3d3d;color:white}
+#status {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+}
+
+#status.connecting::before {
+    content: "";
+    width: 9px;
+    height: 9px;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+#status.connected::before {
+    content: "";
+    width: 9px;
+    height: 9px;
+    background: #22c55e;
+    border-radius: 50%;
+}
+
+#status.disconnected::before {
+    content: "";
+    width: 9px;
+    height: 9px;
+    background: #ef4444;
+    border-radius: 50%;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
 </style>
 </head>
 <body>
@@ -89,13 +133,20 @@ let processor = null;
 let source = null;
 let transcript = [];
 let mp3Chunks = [];
+let bargeInFrames = 0;
 
 let nextPcmStartTime = 0;
 let pcmSources = [];
+const PCM_PREBUFFER_SECONDS = 0.15;
+const MAX_PENDING_AUDIO_FRAMES = 100;
 
 let interruptSent = false;
 let currentAudio = null;
 let assistantSpeaking = false;
+let listeningReady = false;
+let pendingAudioFrames = [];
+let bufferingAudio = false;
+let playbackGeneration = 0;
 
 const chat = document.getElementById("chat");
 const statusEl = document.getElementById("status");
@@ -113,7 +164,6 @@ function setButtonsEnabled(enabled) {
 }
 
 setButtonsEnabled(false);
-
 
 function addMsg(type, text){
 
@@ -139,7 +189,27 @@ function addMsg(type, text){
     const bubble = document.createElement("div");
 
     bubble.className = `msg ${type}`;
-    bubble.textContent = text;
+
+    // ── Current local time ───────────────────────────────
+    const now = new Date();
+
+    const time = now.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+    });
+
+    // Message text
+    const textElement = document.createElement("div");
+    textElement.textContent = text;
+
+    // Message timestamp
+    const timeElement = document.createElement("div");
+    timeElement.className = "message-time";
+    timeElement.textContent = time;
+
+    bubble.appendChild(textElement);
+    bubble.appendChild(timeElement);
 
     if(type === "user"){
         row.appendChild(bubble);
@@ -156,7 +226,8 @@ function addMsg(type, text){
 
     transcript.push({
         role: type,
-        text
+        text,
+        time
     });
 }
 
@@ -189,30 +260,44 @@ async function startMic() {
     const inputData = event.inputBuffer.getChannelData(0);
 
     console.log("Mic samples:", inputData.length);
+
+    const outputData = event.outputBuffer.getChannelData(0);
+    outputData.fill(0);
+
     let energy = 0;
 
     for (let i = 0; i < inputData.length; i++) {
-        energy += Math.abs(inputData[i]);
+        energy += inputData[i] * inputData[i];
     }
 
-    energy /= inputData.length;
+    const rms = Math.sqrt(energy / inputData.length);
+
+    if (assistantSpeaking && !interruptSent && rms > 0.06) {
+        bargeInFrames++;
+    } else {
+        bargeInFrames = 0;
+    }
+
     if (
         assistantSpeaking &&
         !interruptSent &&
-        energy > 0.03 &&
+        bargeInFrames >= 2 &&
         ws.readyState === WebSocket.OPEN
     ) {
         interruptSent = true;
-        console.log("BARGE-IN DETECTED");
+        bargeInFrames = 0;
 
-        ws.send(
-            JSON.stringify({
-                type: "interrupt"
-            })
-        );
+        console.log("BARGE-IN DETECTED", { rms });
 
-       stopAudio();
+        ws.send(JSON.stringify({ type: "interrupt" }));
+        stopAudio();
     }
+
+    // Don't send microphone audio until the greeting is finished
+    // and the server confirms that STT is ready.
+    // if (!listeningReady) {
+    //     return;
+    // }
 
     const pcm = new Int16Array(inputData.length);
 
@@ -221,7 +306,17 @@ async function startMic() {
         pcm[i] = s < 0 ? s * 32768 : s * 32767;
     }
 
-    ws.send(pcm.buffer);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        if (listeningReady) {
+            ws.send(pcm.buffer);
+        }else if (bufferingAudio) {
+            if (pendingAudioFrames.length < MAX_PENDING_AUDIO_FRAMES) {
+                pendingAudioFrames.push(pcm.slice());
+            } else {
+                console.warn("Pending audio buffer limit reached");
+            }
+        }
+    }
     console.log("Sent", pcm.byteLength, "bytes");
 };
 
@@ -255,7 +350,10 @@ function stopMic() {
 
 function stopAudio() {
 
+    playbackGeneration++;
     assistantSpeaking = false;
+    interruptSent = true;
+    bargeInFrames = 0;
 
     // ── Stop MP3 ─────────────────────────────────────────
     if (currentAudio) {
@@ -279,8 +377,9 @@ function stopAudio() {
     nextPcmStartTime = 0;
 }
 
-function playPCMChunk(bytes) {
+async function playPCMChunk(bytes) {
 
+    const generation = playbackGeneration;
     const sampleRate = 24000; // ElevenLabs pcm_24000
 
     // Create separate playback context
@@ -292,7 +391,12 @@ function playPCMChunk(bytes) {
 
     // Resume if browser suspended it
     if (playbackAudioContext.state === "suspended") {
-        playbackAudioContext.resume();
+        await playbackAudioContext.resume();
+    }
+
+    // An interruption may have happened during resume().
+    if (generation !== playbackGeneration) {
+        return;
     }
 
     // PCM s16le = signed 16-bit little-endian samples
@@ -324,11 +428,27 @@ function playPCMChunk(bytes) {
     sourceNode.buffer = audioBuffer;
     sourceNode.connect(playbackAudioContext.destination);
 
-    // Schedule chunks continuously to avoid gaps
-    const startTime = Math.max(
-        playbackAudioContext.currentTime,
-        nextPcmStartTime
-    );
+    // Schedule chunks continuously to avoid gaps. When the queue is empty
+    // (stream start or underrun), start slightly in the future so network
+    // jitter on the next chunks doesn't cause audible breaks.
+    const now = playbackAudioContext.currentTime;
+    const chunkDuration = bytes.byteLength / (sampleRate * 2);
+
+    const schedulingGap = nextPcmStartTime > 0
+        ? now - nextPcmStartTime
+        : 0;
+
+    console.log("[PCM PLAYBACK]", {
+        arrivalTime: performance.now().toFixed(1),
+        chunkBytes: bytes.byteLength,
+        chunkDurationMs: (chunkDuration * 1000).toFixed(1),
+        currentTime: now.toFixed(3),
+        nextPcmStartTime: nextPcmStartTime.toFixed(3),
+        schedulingGapMs: (schedulingGap * 1000).toFixed(1)
+    });
+    const startTime = nextPcmStartTime > now
+        ? nextPcmStartTime
+        : now + PCM_PREBUFFER_SECONDS;
 
     sourceNode.start(startTime);
 
@@ -339,6 +459,7 @@ function playPCMChunk(bytes) {
 
     assistantSpeaking = true;
     interruptSent = false;
+    bargeInFrames = 0;
 
     sourceNode.onended = () => {
         pcmSources = pcmSources.filter(
@@ -347,202 +468,301 @@ function playPCMChunk(bytes) {
     };
 }
 
-function connect(){
-  ws = new WebSocket(WS_URL);
+function setConnectionStatus(state, text) {
+    statusEl.textContent = text;
 
-  ws.onopen = () => {
-    statusEl.textContent = "Connecting...";
-  };
-
-  ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    console.log(msg.type, msg.encoding);
-
-    if(msg.type === "system_ready"){
-      statusEl.textContent = "Connected";
-      setButtonsEnabled(true);
-      return;
-  }
-
-  if(msg.type === "transcript"){
-      addMsg(
-        msg.speaker === "assistant" ? "ai" : "user",
-        msg.text
-    );
-    return;
-  }
-
-if (msg.type === "audio_chunk") {
-
-    const binary = atob(msg.audio);
-
-    const bytes = new Uint8Array(binary.length);
-
-    for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-    }
-
-    // ── Real-time PCM playback ──────────────────────────
-    if (msg.encoding === "pcm_s16le") {
-
-        playPCMChunk(bytes);
-
-        return;
-    }
-
-    // ── Buffered MP3 playback ────────────────────────────
-    if (msg.encoding === "mp3") {
-
-        mp3Chunks.push(bytes);
-
-        return;
-    }
-
-    console.warn(
-        "Unknown audio encoding:",
-        msg.encoding
+    statusEl.classList.remove(
+        "connecting",
+        "connected",
+        "disconnected"
     );
 
-    return;
+    statusEl.classList.add(state);
 }
 
-if (msg.type === "complete") {
+function connect(){
 
-    // ── PCM path ─────────────────────────────────────────
-    if (msg.encoding === "pcm_s16le") {
+    // Initial state
+    setConnectionStatus("disconnected", "Disconnected");
 
-        console.log("PCM stream complete");
+    // Give the user a moment to see the initial state
+    setTimeout(() => {
 
-        const checkPlaybackFinished = () => {
+        setConnectionStatus("connecting", "Connecting...");
 
-            if (
-                playbackAudioContext &&
-                playbackAudioContext.currentTime >= nextPcmStartTime
-            ) {
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+
+            setConnectionStatus(
+                "connecting",
+                "Connected — initializing..."
+            );
+        };
+
+        ws.onmessage = (event) => {
+
+            const msg = JSON.parse(event.data);
+
+            console.log(msg.type, msg.encoding);
+
+            if(msg.type === "system_ready"){
+
+                setConnectionStatus(
+                    "connected",
+                    "Connected"
+                );
+
+                setButtonsEnabled(true);
+
+                return;
+            }
+
+            if(msg.type === "transcript"){
+                addMsg(
+                    msg.speaker === "assistant" ? "ai" : "user",
+                    msg.text
+                );
+                return;
+            }
+
+            if (msg.type === "audio_chunk") {
+
+                const binary = atob(msg.audio);
+
+                const bytes = new Uint8Array(binary.length);
+
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+
+
+                if (msg.encoding === "pcm_s16le") {
+                    playPCMChunk(bytes);
+                    return;
+                }
+
+                
+                if (msg.encoding === "mp3") {
+
+                    mp3Chunks.push(bytes);
+
+                    return;
+                }
+
+                console.warn(
+                    "Unknown audio encoding:",
+                    msg.encoding
+                );
+
+                return;
+            }
+
+            if (msg.type === "complete") {
+
+                if (msg.encoding === "pcm_s16le") {
+
+                    console.log("PCM stream complete");
+
+                    const generation = playbackGeneration;
+
+                    const checkPlaybackFinished = () => {
+
+                        if (generation !== playbackGeneration) {
+                            return;
+                        }
+
+                        if (
+                            playbackAudioContext &&
+                            playbackAudioContext.currentTime >= nextPcmStartTime
+                        ) {
+
+                            assistantSpeaking = false;
+                            nextPcmStartTime = 0;
+
+                            console.log(
+                                "PCM playback completed"
+                            );
+
+                        } else {
+
+                            setTimeout(
+                                checkPlaybackFinished,
+                                50
+                            );
+                        }
+                    };
+
+                    checkPlaybackFinished();
+
+                    return;
+                }
+
+                const blob = new Blob(
+                    mp3Chunks,
+                    { type: "audio/mpeg" }
+                );
+
+                const url = URL.createObjectURL(blob);
+
+                currentAudio = new Audio(url);
+
+                assistantSpeaking = true;
+                interruptSent = false;
+
+                currentAudio.onended = () => {
+
+                    assistantSpeaking = false;
+
+                    URL.revokeObjectURL(url);
+                };
+
+                currentAudio.play()
+                    .then(() => {
+                        console.log("MP3 audio started");
+                    })
+                    .catch(err => {
+
+                        console.error(
+                            "Audio play failed:",
+                            err
+                        );
+                    });
+
+                mp3Chunks = [];
+
+                return;
+            }
+
+            if(msg.type === "word"){
+                return;
+            }
+
+            if(msg.type === "clear_audio") {
+
+                console.log("CLEAR_AUDIO RECEIVED");
+
+                stopAudio();
+
+                return;
+            }
+
+            if (msg.type === "error") {
+
+                addMsg(
+                    "ai",
+                    `Error: ${msg.message}`
+                );
+
+                return;
+            }
+
+            if (msg.type === "tts_error") {
+
+                console.error(
+                    "TTS Error:",
+                    msg.message
+                );
+
                 assistantSpeaking = false;
-                nextPcmStartTime = 0;
+                mp3Chunks = [];
 
-                console.log("PCM playback completed");
+                statusEl.textContent =
+                    "Audio unavailable. You can continue speaking.";
 
-            } else {
-                setTimeout(checkPlaybackFinished, 50);
+                return;
+            }
+
+            if (msg.type === "session_ended") {
+
+                statusEl.textContent =
+                    "Session ended";
+
+                stopMic();
+
+                assistantSpeaking = false;
+
+                return;
+            }
+
+            if (msg.type === "greeting_started") {
+
+                statusEl.textContent =
+                    "Assistant speaking...";
+
+                return;
+            }
+
+            if (msg.type === "greeting_done") {
+                bufferingAudio = true;
+                statusEl.textContent =
+                    "Greeting completed";
+
+                return;
+            }
+
+            if (msg.type === "listening_ready") {
+                for (const frame of pendingAudioFrames) {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(frame.buffer);
+                    }
+                }
+                pendingAudioFrames = [];
+                bufferingAudio = false;
+                listeningReady = true;
+                statusEl.textContent =
+                    "Listening...";
+
+                return;
+            }
+
+            if (msg.type === "status") {
+
+                statusEl.textContent =
+                    msg.text;
+
+                return;
+            }
+
+            if (msg.type === "human_handoff") {
+
+                addMsg(
+                    "ai",
+                    "Connecting you to a human agent..."
+                );
+
+                statusEl.textContent =
+                    "Human handoff";
+
+                stopMic();
+
+                return;
             }
         };
 
-        checkPlaybackFinished();
+        ws.onerror = () => {
 
-        return;
-    }
-
-
-    // ── MP3 path ─────────────────────────────────────────
-    const blob = new Blob(mp3Chunks, {
-        type: "audio/mpeg"
-    });
-
-    const url = URL.createObjectURL(blob);
-
-    currentAudio = new Audio(url);
-
-    assistantSpeaking = true;
-    interruptSent = false;
-
-    currentAudio.onended = () => {
-        assistantSpeaking = false;
-        URL.revokeObjectURL(url);
-    };
-
-    currentAudio.play()
-        .then(() => {
-            console.log("MP3 audio started");
-        })
-        .catch(err => {
-            console.error(
-                "Audio play failed:",
-                err
+            setConnectionStatus(
+                "disconnected",
+                "Connection failed"
             );
-        });
 
-    mp3Chunks = [];
+            setButtonsEnabled(false);
+        };
 
-    return;
-}
+        ws.onclose = () => {
 
-    if(msg.type === "word"){
-        return;
-    }
+            setConnectionStatus(
+                "disconnected",
+                "Disconnected"
+            );
 
-    if(msg.type === "clear_audio") {
+            setButtonsEnabled(false);
 
-        console.log("CLEAR_AUDIO RECEIVED");
+            stopMic();
+        };
 
-        stopAudio();
-
-        return;
-    }
-
-    if (msg.type === "error") {
-    addMsg("ai", `Error: ${msg.message}`);
-    return;
-   }
-
-   if (msg.type === "tts_error") {
-    console.error("TTS Error:", msg.message);
-
-    assistantSpeaking = false;
-    mp3Chunks = [];
-
-    statusEl.textContent = "Audio unavailable. You can continue speaking.";
-    return;
-}
-
-   if (msg.type === "session_ended") {
-    statusEl.textContent = "Session ended";
-    stopMic();
-    assistantSpeaking = false;
-    return;
-   
-  
-  }
-
-  if (msg.type === "greeting_started") {
-    statusEl.textContent = "Assistant speaking...";
-    return;
-  }
-
-  if (msg.type === "greeting_done") {
-    statusEl.textContent = "Greeting completed";
-    return;
-  }
-  
-  if (msg.type === "listening_ready") {
-    statusEl.textContent = "Listening...";
-    return;
-  }
-
-  if (msg.type === "status") {
-    statusEl.textContent = msg.text;
-    return;
-  }
-
-  if (msg.type === "human_handoff") {
-    addMsg(
-        "ai",
-        "Connecting you to a human agent..."
-    );
-
-    statusEl.textContent = "Human handoff";
-    stopMic();
-    return;
-  } 
-
-  };
-
-  ws.onclose = () => {
-    statusEl.textContent = "Disconnected";
-    stopMic();
-    //setTimeout(connect, 2000);
-  };
+    }, 500);
 }
 
 document.getElementById("start").onclick = async () => {
@@ -555,12 +775,17 @@ document.getElementById("start").onclick = async () => {
         return;
     }
 
+    listeningReady = false;
+    bufferingAudio = false;
+    pendingAudioFrames = [];
     await startMic();
-
     ws.send(JSON.stringify({ type: "start" }));
 };
 
 document.getElementById("stop").onclick = () => {
+  listeningReady = false;
+  bufferingAudio = false;
+  pendingAudioFrames = [];
   if(ws && ws.readyState === WebSocket.OPEN){
     ws.send(JSON.stringify({ type: "stop" }));
   }

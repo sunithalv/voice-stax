@@ -6,6 +6,7 @@ streams responses, and stops early when a session interrupt is requested.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -16,6 +17,98 @@ from voicestax.utils.logger import logger
 
 class ChatEngine:
     """Manage conversation history and interact with an LLM provider."""
+
+    UNPARSEABLE_RESPONSE = (
+        "Sorry, I didn't catch that properly. Could you say it again?"
+    )
+
+    # Keys under which models sometimes nest the real payload,
+    # e.g. tool-call style {"name": "assistant", "arguments": {...}}.
+    _WRAPPER_KEYS = ("arguments", "parameters", "args", "input", "output", "content")
+
+    @classmethod
+    def _find_response_payload(cls, value: Any, depth: int = 0) -> dict | None:
+        """Return the first nested dict that contains a "response" field."""
+
+        if depth > 4:
+            return None
+
+        # Tool-call arguments are often a JSON-encoded string.
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return None
+
+        if not isinstance(value, dict):
+            return None
+
+        if isinstance(value.get("response"), str):
+            return value
+
+        for key in cls._WRAPPER_KEYS:
+            if key in value:
+                found = cls._find_response_payload(value[key], depth + 1)
+                if found is not None:
+                    return found
+
+        return None
+
+    @classmethod
+    def _recover_structured_response(cls, raw: str) -> LLMResponse | None:
+        """Best-effort extraction of an LLMResponse from malformed model output."""
+
+        start = raw.find("{")
+        end = raw.rfind("}")
+
+        if start == -1 or end <= start:
+            return None
+
+        payload = cls._find_response_payload(raw[start : end + 1])
+
+        if payload is None or not payload["response"].strip():
+            return None
+
+        intent = payload.get("intent")
+        if intent not in LLMResponse.model_fields["intent"].annotation.__args__:
+            intent = "conversation"
+
+        return LLMResponse(intent=intent, response=payload["response"].strip())
+    
+    
+    @classmethod
+    def _recover_labeled_response(cls, raw: str) -> LLMResponse | None:
+        """Recover responses formatted as 'Intent: ...\\nResponse: ...'."""
+
+        import re
+
+        match = re.search(
+            r"^\s*Intent\s*:\s*(conversation|clarification|"
+            r"end_conversation|human_handoff)\s*"
+            r"\n\s*Response\s*:\s*(.*?)\s*$",
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        if not match:
+            return None
+
+        intent = match.group(1).lower()
+        response = match.group(2).strip()
+
+        # Remove a matching pair of surrounding quotes only.
+        if (
+            len(response) >= 2
+            and response[0] == response[-1]
+            and response[0] in {'"', "'"}
+        ):
+            response = response[1:-1].strip()
+
+        if not response:
+            return None
+
+        return LLMResponse(intent=intent, response=response)
+
 
     def __init__(
         self,
@@ -61,6 +154,12 @@ class ChatEngine:
         """Build the system message plus conversation history."""
 
         system_prompt = session.settings.llm_system_prompt
+        
+        logger.info(
+            "%s [LLM] System prompt contains json=%s",
+            session.log_prefix(),
+            "json" in system_prompt.lower(),
+        )
 
         return [
             {
@@ -119,6 +218,23 @@ class ChatEngine:
                     )
 
             return full_response
+        
+        system_prompt = next(
+            (
+                message["content"]
+                for message in messages
+                if message.get("role") == "system"
+            ),
+            "",
+        )
+
+        logger.debug(
+            "%s [LLM] Request check: system_prompt_has_json=%s, "
+            "system_prompt_start=%r",
+            session.log_prefix(),
+            "json" in system_prompt.lower(),
+            system_prompt[:250],
+        )
 
         return await asyncio.to_thread(consume_stream)
 
@@ -178,21 +294,64 @@ class ChatEngine:
             # Check if the session was interrupted during streaming (e.g., by barge-in).
             interrupted = session.cancel_event.is_set()
 
+        
         except Exception as exc:
-            # Remove the user message if the LLM request failed.
-            if history and history[-1] is user_message:
-                history.pop()
+            error_body = getattr(exc, "body", None)
 
-            logger.error(
-                "%s [LLM ERROR] Request failed: %s: %s",
-                session.log_prefix(),
-                type(exc).__name__,
-                exc,
-            )
+            # Some LLM JSON-mode failures include the generated plain text
+            # in the error body. Recover it when it is available.
+            failed_generation = None
 
-            raise LLMError(
-                f"LLM request failed: {exc}"
-            ) from exc
+            if isinstance(error_body, dict):
+                failed_generation = error_body.get(
+                    "failed_generation"
+                )
+
+                # Some SDK errors wrap the API body in an "error" object.
+                if isinstance(error_body.get("error"), dict):
+                    failed_generation = (
+                        failed_generation
+                        or error_body["error"].get("failed_generation")
+                    )
+
+            if (
+                isinstance(failed_generation, str)
+                and failed_generation.strip()
+                and not session.cancel_event.is_set()
+            ):
+                recovered_text = failed_generation.strip()
+
+                logger.warning(
+                    "%s [LLM] Recovering plain-text generation "
+                    "after provider JSON validation failure",
+                    session.log_prefix(),
+                )
+
+                full_response = recovered_text
+                interrupted = False
+
+            else:
+                # Remove the user message because the LLM request failed.
+                if history and history[-1] is user_message:
+                    history.pop()
+
+                if error_body:
+                    logger.error(
+                        "%s [LLM] Error details: %s",
+                        session.log_prefix(),
+                        error_body,
+                    )
+
+                logger.error(
+                    "%s [LLM ERROR] Request failed: %s: %s",
+                    session.log_prefix(),
+                    type(exc).__name__,
+                    exc,
+                )
+
+                raise LLMError(
+                    f"LLM request failed: {exc}"
+                ) from exc
 
         finally:
             # Record the time when the LLM request ends for latency metrics
@@ -259,19 +418,43 @@ class ChatEngine:
                 parsed.intent,
             )
 
-        except Exception as exc:
+        except Exception:
             logger.warning(
-                "%s [LLM] Structured response parsing failed; "
-                "using raw response fallback: %s",
+                "%s [LLM] Structured response parsing failed. "
+                "Raw response starts with: %r",
                 session.log_prefix(),
-                exc,
+                full_response[:300],
             )
+
+            # Recover the intent/response object when the model wrapped it,
+            # e.g. a tool-call shape {"name": ..., "arguments": {...}} or
+            # JSON surrounded by markdown fences or extra text.
             
-            # Use the raw response as a fallback if structured parsing fails.
-            parsed = LLMResponse(
-                intent="conversation",
-                response=full_response,
-            )
+            parsed = self._recover_structured_response(full_response)
+
+            if parsed is None:
+                parsed = self._recover_labeled_response(full_response)
+
+            if parsed is not None:
+                logger.info(
+                    "%s [LLM] Recovered structured response "
+                    "from malformed output: intent=%s",
+                    session.log_prefix(),
+                    parsed.intent,
+                )
+            elif full_response.lstrip().startswith(("{", "[")):
+                # Never speak raw JSON to the user.
+                parsed = LLMResponse(
+                    intent="conversation",
+                    response=self.UNPARSEABLE_RESPONSE,
+                )
+            else:
+                # Plain-text reply without a recognized wrapper.
+                parsed = LLMResponse(
+                    intent="conversation",
+                    response=full_response.strip(),
+                )
+
         # Append the assistant's response to the session conversation history 
         history.append(
             {

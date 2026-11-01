@@ -32,12 +32,12 @@ class WebRTCVAD(BaseVAD):
     )
 
     DEFAULTS: dict[str, Any] = {
-        "aggressiveness": 2,
+        "aggressiveness": 3,
         "sample_rate": 16000,
         "frame_duration_ms": 20,
     }
 
-    def __init__(self, **kwargs: Any):
+    def __init__(self, log_prefix: str,**kwargs: Any):
         """Initialize the WebRTC VAD provider.
 
         Provider defaults can be overridden through ``**kwargs``.
@@ -50,7 +50,8 @@ class WebRTCVAD(BaseVAD):
 
         if unsupported_keys:
             logger.error(
-                "Unsupported WebRTC VAD configuration: %s",
+                "%s [WebRTC VAD] Unsupported WebRTC VAD configuration: %s",
+                self.log_prefix,
                 sorted(unsupported_keys),
             )
             raise ValueError(
@@ -58,6 +59,7 @@ class WebRTCVAD(BaseVAD):
                 f"{sorted(unsupported_keys)}"
             )
 
+        self.log_prefix=log_prefix
         # Merge provider defaults with user-supplied configuration.
         # User values override the defaults.
         self.config: dict[str, Any] = {
@@ -93,9 +95,10 @@ class WebRTCVAD(BaseVAD):
         self.valid_frame_sizes = {frame_size}
 
         logger.debug(
-            "WebRTC VAD provider initialized. "
+            "%s [WebRTC VAD] provider initialized. "
             "aggressiveness=%s, sample_rate=%s, "
             "frame_duration_ms=%s",
+            self.log_prefix,
             self.aggressiveness,
             self.sample_rate,
             self.frame_duration_ms,
@@ -112,7 +115,8 @@ class WebRTCVAD(BaseVAD):
             or aggressiveness not in (0, 1, 2, 3)
         ):
             logger.error(
-                "Invalid WebRTC VAD aggressiveness: %s",
+                "%s [WebRTC VAD] Invalid WebRTC VAD aggressiveness: %s",
+                self.log_prefix,
                 aggressiveness,
             )
             raise ValueError(
@@ -123,7 +127,8 @@ class WebRTCVAD(BaseVAD):
 
         if sample_rate not in self.SUPPORTED_SAMPLE_RATES:
             logger.error(
-                "Unsupported WebRTC VAD sample rate: %s",
+                "%s [WebRTC VAD] Unsupported WebRTC VAD sample rate: %s",
+                self.log_prefix,
                 sample_rate,
             )
             raise ValueError(
@@ -134,7 +139,8 @@ class WebRTCVAD(BaseVAD):
 
         if frame_duration_ms not in self.VALID_DURATIONS_MS:
             logger.error(
-                "Unsupported WebRTC VAD frame duration: %s ms",
+                "%s [WebRTC VAD] Unsupported WebRTC VAD frame duration: %s ms",
+                self.log_prefix,
                 frame_duration_ms,
             )
             raise ValueError(
@@ -155,8 +161,9 @@ class WebRTCVAD(BaseVAD):
         # 10, 20, or 30 ms of audio at the configured sample rate.
         if len(audio_chunk) not in self.valid_frame_sizes:
             logger.warning(
-                "Invalid WebRTC VAD frame size: %d bytes "
+                "%s [WebRTC VAD] Invalid WebRTC VAD frame size: %d bytes "
                 "(expected %s)",
+                self.log_prefix,
                 len(audio_chunk),
                 sorted(self.valid_frame_sizes),
             )

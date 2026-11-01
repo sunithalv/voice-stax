@@ -33,7 +33,7 @@ def get_llm_provider(
         provider = get_llm_provider(
             provider_name="groq",
             api_key=settings.llm_api_key,
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             max_tokens=120,
             temperature=0.2,
         )

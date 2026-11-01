@@ -14,7 +14,7 @@ from typing import Optional
 
 from voicestax.config.settings import VoiceSettings, get_settings
 from voicestax._version import __version__
-from voicestax.utils.logger import logger
+from voicestax.utils.logger import setup_logging,logger
 
 
 def create_voice_app(
@@ -29,6 +29,11 @@ def create_voice_app(
     """
 
     resolved_settings = get_settings(override=settings)
+    
+    # Configure VoiceStax logging 
+    setup_logging(
+        level=resolved_settings.log_level,
+    )
 
     logger.info("Creating VoiceStax FastAPI application")
 

@@ -49,22 +49,58 @@ class VoiceSettings(BaseSettings):
     vad_config: Dict[str, Any] = Field(default_factory=dict)
 
     # VoiceStax pipeline configuration
-    vad_silence_threshold_ms: int = 300
+    vad_silence_threshold_ms: int = 800
     vad_max_utterance_ms: int = 20_000
 
     llm_system_prompt: str = Field(
         default=(
             "You are a real-time voice assistant. "
-            "Your ENTIRE response must be ONLY a valid JSON object — "
-            "no other text, no explanation, no preamble. "
-            'Format: {"intent": "conversation|clarification|end_conversation|human_handoff", '
-            '"response": "your reply in 1-2 short conversational sentences"}'
+
+            "OUTPUT FORMAT: "
+            "Return exactly one valid JSON object with exactly two fields: "
+            '"intent" and "response". '
+            'The "intent" must be one of: conversation, clarification, '
+            "end_conversation, human_handoff. "
+            'The "response" must be a string containing the spoken reply. '
+            "Return JSON only, with no markdown or text outside the object. "
+            "Do not call tools or functions, and do not wrap the object in "
+            'any other structure such as "name" or "arguments". '
+            "Ensure all JSON strings are properly escaped. "
+
+            "CONVERSATION: "
+            "Use conversation history to understand the user's meaning, "
+            "including short replies such as yes, no, fine, and okay. "
+            "Respond helpfully and naturally. "
+            "Keep the conversation going: after answering or explaining "
+            "something, end with one short, relevant follow-up question "
+            "or offer, such as a related subtopic the user might want "
+            "to explore next. Vary the follow-ups and do not repeat "
+            "questions already answered. "
+            "Never invent facts or user intentions. "
+            "Ask for clarification when the meaning is genuinely unclear. "
+            "Short acknowledgements such as good, okay, nice, cool, "
+            "great, or thanks are NOT a request to end the conversation; "
+            "treat them as conversation and continue with a relevant "
+            "next step or question. "
+            "Use end_conversation only when the user explicitly says "
+            "goodbye or clearly states they want to stop. "
+            "Use human_handoff when a human handoff "
+            "is appropriate and supported by the application. "
+
+            "VOICE STYLE: "
+            "The response string will be sent directly to text-to-speech. "
+            "Use natural spoken language, short sentences, and simple "
+            "punctuation. Avoid markdown, lists, emojis, and decorative "
+            "symbols. Normally keep the spoken reply to one or two "
+            "short sentences. "
+            "Answer the user's actual request before adding a follow-up."
         ),
         description=(
-            "Core VoiceStax system prompt defining conversational behavior "
-            "and the structured LLM response format."
+            "Core VoiceStax system prompt defining conversational "
+            "behaviour and structured LLM output."
         ),
     )
+
 
     llm_timeout_seconds: int = 20
 

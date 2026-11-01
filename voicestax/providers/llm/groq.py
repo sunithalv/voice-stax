@@ -15,7 +15,6 @@ from typing import Any
 from groq import Groq
 
 from voicestax.providers.llm.base import BaseLLMProvider
-from voicestax.utils import session
 from voicestax.utils.exceptions import (
     LLMStreamingError,
     LLMValidationError,
@@ -43,7 +42,7 @@ class GroqLLMProvider(BaseLLMProvider):
 
         GroqLLMProvider(
             api_key="...",
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             max_tokens=120,
             temperature=0.2,
             top_p=0.9,
@@ -51,13 +50,16 @@ class GroqLLMProvider(BaseLLMProvider):
     """
 
     DEFAULTS: dict[str, Any] = {
-        "model": "llama-3.3-70b-versatile",
-        "max_tokens": 120,
+        "model": "openai/gpt-oss-20b",
+        "max_tokens": 1024 ,
+        "response_format": {"type": "json_object"},
+        "reasoning_effort": "low",    
     }
 
     def __init__(
         self,
         api_key: str,
+        log_prefix: str,
         **kwargs: Any,
     ):
         """
@@ -71,7 +73,8 @@ class GroqLLMProvider(BaseLLMProvider):
             raise LLMValidationError(
                 "Groq API key is required"
             )
-
+        
+        self.log_prefix = log_prefix
 
         # Merge provider defaults with user-supplied configuration.
         # User values override the defaults.
@@ -91,16 +94,19 @@ class GroqLLMProvider(BaseLLMProvider):
         self.extra_config = {
             key: value
             for key, value in self.config.items()
-            if key not in self.DEFAULTS
+            if key not in {"model", "max_tokens"}
         }
 
         # The client is created once and reused for the provider lifetime.
-        self.client = Groq(api_key=api_key)
+        # gives the synchronous SDK an explicit timeout rather than relying on its default
+        self.client = Groq(api_key=api_key,
+                           timeout=15.0,)
+        
 
         logger.debug(
             "%s [Groq] Provider initialized. "
             "model=%s, max_tokens=%s, extra_config_keys=%s",
-            session.get_log_prefix(),
+            self.log_prefix,
             self.model,
             self.max_tokens,
             sorted(self.extra_config.keys()),
@@ -146,7 +152,7 @@ class GroqLLMProvider(BaseLLMProvider):
 
         logger.debug(
             "%s [Groq] Validating API key",
-            session.get_log_prefix(),
+            self.log_prefix,
         )
 
         try:
@@ -154,7 +160,7 @@ class GroqLLMProvider(BaseLLMProvider):
 
             logger.info(
                 "%s [Groq] API key validation succeeded",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
 
             return True
@@ -162,7 +168,7 @@ class GroqLLMProvider(BaseLLMProvider):
         except Exception as exc:
             logger.error(
                 "%s [Groq] API key validation failed: %s: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 type(exc).__name__,
                 exc,
             )
@@ -203,7 +209,7 @@ class GroqLLMProvider(BaseLLMProvider):
         logger.debug(
             "%s [Groq] Starting chat stream. "
             "model=%s, message_count=%s, parameter_keys=%s",
-            session.get_log_prefix(),
+            self.log_prefix,
             self.model,
             len(messages),
             sorted(params.keys()),
@@ -216,7 +222,7 @@ class GroqLLMProvider(BaseLLMProvider):
 
             logger.debug(
                 "%s [Groq] Chat stream created successfully",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
 
             return response
@@ -224,7 +230,7 @@ class GroqLLMProvider(BaseLLMProvider):
         except Exception as exc:
             logger.error(
                 "%s [Groq] Chat streaming failed: %s: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 type(exc).__name__,
                 exc,
             )

@@ -91,3 +91,42 @@ def detect_local_intent(text: str) -> str | None:
         return "human_handoff"
 
     return None
+
+def prepare_text_for_tts(text: str) -> str:
+    """
+    Prepare LLM-generated text for smooth text-to-speech playback.
+
+    Removes visual formatting such as Markdown while preserving
+    meaningful spoken content.
+    """
+
+    if not text:
+        return ""
+
+    # Remove Markdown code blocks.
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+
+    # Remove Markdown headings.
+    text = re.sub(r"^\s*#{1,6}\s*", "", text, flags=re.MULTILINE)
+
+    # Remove bullet points and numbered-list markers.
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.MULTILINE)
+
+    # Remove Markdown bold / italic markers.
+    text = text.replace("**", "")
+    text = text.replace("__", "")
+    text = text.replace("*", "")
+    text = text.replace("_", "")
+
+    # Convert Markdown links:
+    # [text](url) -> text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+    # Remove blockquote marker.
+    text = re.sub(r"^\s*>\s*", "", text, flags=re.MULTILINE)
+
+    # Collapse newlines and repeated whitespace.
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()

@@ -14,6 +14,11 @@ from voicestax.utils.logger import logger
 class AudioManager:
     """Manages TTS audio generation and streaming over WebSocket."""
 
+    # Target size of each PCM WebSocket message (~200 ms at 24 kHz, 16-bit mono).
+    PCM_MESSAGE_BYTES = 9600
+    # Playback lead time the browser client adds before starting PCM audio.
+    CLIENT_PREBUFFER_SECONDS = 0.15
+
     def __init__(self, tts_client: BaseTTSProvider, stt_client: BaseSTTProvider):
         self.tts_client = tts_client
         self.stt_client = stt_client
@@ -56,6 +61,17 @@ class AudioManager:
         words = text.split()
         return int((duration_sec * 1000) / max(len(words), 1))
     
+    def _pcm_duration_seconds(self, pcm_bytes: int, sample_width: int = 2) -> float:
+        """Playback duration of mono PCM audio, using the rate from e.g. 'pcm_24000'."""
+        output_format = str(getattr(self.tts_client, "output_format", "") or "")
+
+        try:
+            sample_rate = int(output_format.split("_")[1])
+        except (IndexError, ValueError):
+            sample_rate = 24000
+
+        return pcm_bytes / (sample_rate * sample_width)
+
     # Stream text to the client via WebSocket, handling TTS generation, chunking, and STT muting.
     async def stream_text(self, websocket, text: str, session):
         # Ignore empty messages
@@ -109,6 +125,10 @@ class AudioManager:
                 """Push TTS chunks into the queue from a thread."""
                 def _iterate():
                     try:
+                        logger.debug(
+                            "%s [TTS] Starting synchronous TTS generation in worker thread",
+                            session.log_prefix(),
+                        )
                         # Returns an iterator of audio chunks
                         response = self.tts_client.stream_tts(text=text)
                         
@@ -119,13 +139,30 @@ class AudioManager:
                         )
 
                         # Iterates synchronous response, puts chunks into the asyncio queue
+                        first_provider_chunk_time = None
                         for chunk in response:
+                            if first_provider_chunk_time is None:
+                                first_provider_chunk_time = time.perf_counter()
+
+                                provider_first_chunk_latency = (
+                                    first_provider_chunk_time - session.tts_start_time
+                                ) * 1000
+
+                                logger.info(
+                                    "%s [TTS TIMING] First chunk yielded by TTS: %.2f ms after TTS start",
+                                    session.log_prefix(),
+                                    provider_first_chunk_latency,
+                                )
                             # Schedules work on asyncio event loop in a thread-safe way and
                             # places the chunk into an asyncio.Queue immediately, without awaiting.
                             loop.call_soon_threadsafe(
                                 chunk_queue.put_nowait,
                                 chunk
                             )
+                        logger.debug(
+                            "%s [TTS] Synchronous TTS stream exhausted",
+                            session.log_prefix(),
+                        )
 
                     except Exception as e:
                         logger.error(
@@ -147,15 +184,70 @@ class AudioManager:
                         )
                 # Runs the synchronous TTS iterator in separate thread to avoid blocking the event loop.
                 await loop.run_in_executor(None, _iterate)
+                logger.debug(
+                    "%s [TTS] Worker thread finished generating audio",
+                    session.log_prefix(),
+                )
                 
             # Create a task to run the producer coroutine that will fill the chunk_queue with audio chunks.
             producer_task = asyncio.create_task(_producer())
+            first_chunk_sent = False
+            # Track how much PCM audio was sent and when, so we can wait for
+            # the browser to finish playing it before reporting completion.
+            first_chunk_sent_time = 0.0
+            pcm_bytes_sent = 0
+            # Queue item read ahead while coalescing chunks (None/exception/bytes).
+            pending_item = None
+            has_pending_item = False
+            # Odd trailing byte carried to the next PCM message so every
+            # message holds whole 16-bit samples.
+            pcm_remainder = b""
 
             while True:
                 # Yield to event loop so cancel_event can be set by
                 # a concurrent handle_user_message call.
-                chunk = await chunk_queue.get()
-                
+                if has_pending_item:
+                    chunk = pending_item
+                    has_pending_item = False
+                else:
+                    chunk = await chunk_queue.get()
+
+                # Coalesce already-queued PCM chunks into one larger message.
+                # The provider yields ~20 ms chunks; sending each one separately
+                # makes WebSocket delivery barely faster than real-time playback,
+                # which causes audible gaps in the browser.
+                if is_pcm and isinstance(chunk, (bytes, bytearray)):
+                    combined = bytearray(pcm_remainder)
+                    combined.extend(chunk)
+
+                    while len(combined) < self.PCM_MESSAGE_BYTES:
+                        try:
+                            next_item = chunk_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+
+                        if not isinstance(next_item, (bytes, bytearray)):
+                            pending_item = next_item
+                            has_pending_item = True
+                            break
+
+                        combined.extend(next_item)
+
+                    # Keep the stream sample-aligned. At end of stream the
+                    # remainder is a single dangling byte and is dropped.
+                    if len(combined) % 2:
+                        pcm_remainder = bytes(combined[-1:])
+                        del combined[-1:]
+                    else:
+                        pcm_remainder = b""
+
+                    if not combined:
+                        continue
+
+                    chunk = bytes(combined)
+
+                queue_receive_time = time.perf_counter()
+
                 # If the chunk is an exception, raise it to propagate the error to the async context.
                 if isinstance(chunk, Exception):
                     raise TTSError(f"TTS provider failed: {chunk}")
@@ -170,17 +262,24 @@ class AudioManager:
                 
                 # Record the time of the first chunk for latency metrics
                 if session.tts_first_chunk_time == 0.0:
-                    session.tts_first_chunk_time = time.perf_counter()
+                    session.tts_first_chunk_time = queue_receive_time
 
                     tts_latency = (
                         session.tts_first_chunk_time
                         - session.tts_start_time
                     ) * 1000
 
+                    logger.info(
+                        "%s [TTS TIMING] First chunk received from queue: %.2f ms after TTS start",
+                        session.log_prefix(),
+                        tts_latency,
+                    )
+                    
                     session.record_latency(
                         "tts_latency",
                         round(tts_latency, 2)
                     )
+                    
                     
                     # End-to-end turn latency ie from end of user speech to first TTS chunk
                     if session.speech_end_time and session.tts_first_chunk_time:
@@ -220,14 +319,52 @@ class AudioManager:
                         len(chunk),
                     )
                     
+                    websocket_send_start = time.perf_counter()
+                    
                     await websocket.send_json({
                         "type": "audio_chunk",
                         "audio": encoded_audio,
                         "encoding": "pcm_s16le" if is_pcm else "mp3",
                         "response_id": response_id,
                     })
+                    
+                    websocket_send_end = time.perf_counter()
+
+                    logger.debug(
+                        "%s [TTS TIMING] WebSocket audio chunk send took %.2f ms",
+                        session.log_prefix(),
+                        (websocket_send_end - websocket_send_start) * 1000,
+                    )
+                    
+                    pcm_bytes_sent += len(chunk)
+
+                    if not first_chunk_sent:
+                        first_chunk_sent = True
+                        first_chunk_sent_time = websocket_send_end
+
+                        logger.info(
+                            "%s [TTS TIMING] First audio chunk sent to WebSocket",
+                            session.log_prefix(),
+                        )
+
+                    if session.tts_first_chunk_time == queue_receive_time:
+                        logger.info(
+                            "%s [TTS TIMING] First audio chunk sent to WebSocket",
+                            session.log_prefix(),
+                        )
+
                 except Exception as e:
-                    raise WebSocketError(f"Failed to send audio chunk: {e}") from e
+                    logger.exception(
+                    "%s [TTS] WebSocket audio chunk send failed "
+                    "(exception_type=%s, exception_repr=%r)",
+                    session.log_prefix(),
+                    type(e).__name__,
+                    e,
+                    )
+                    raise WebSocketError(
+                        f"Failed to send audio chunk "
+                        f"({type(e).__name__}): {e!r}"
+                    ) from e
 
             await producer_task  # ensure thread is cleaned up
 
@@ -276,6 +413,29 @@ class AudioManager:
                 except Exception as e:
                     raise WebSocketError(f"Failed to send complete message: {e}") from e
 
+                # ── 5. Wait for client playback to finish ──────────────────────
+                # TTS chunks arrive much faster than real time, so the stream
+                # finishes sending long before the browser finishes playing.
+                # Stay in the speaking state (STT muted) until playback ends;
+                # otherwise the mic picks up the assistant's own voice and
+                # starts a new turn that cuts off the current response.
+                # The client also delays playback start by a small prebuffer
+                # (PCM_PREBUFFER_SECONDS in chatbot.html), so include it here.
+                remaining_playback = (
+                    first_chunk_sent_time
+                    + self._pcm_duration_seconds(pcm_bytes_sent)
+                    + self.CLIENT_PREBUFFER_SECONDS
+                    - time.perf_counter()
+                )
+
+                if remaining_playback > 0:
+                    logger.debug(
+                        "%s [TTS] Waiting %.2f s for client playback to finish",
+                        session.log_prefix(),
+                        remaining_playback,
+                    )
+                    await asyncio.sleep(remaining_playback)
+
             else:
                 # ── mp3 path ──────────────────────────────────────────────────
                 # Client buffers all mp3 chunks and only starts playback on
@@ -321,7 +481,9 @@ class AudioManager:
             logger.info("%s [TTS] completed",session.log_prefix())
 
         except asyncio.CancelledError:
-            logger.info("%s [TTS] stream_text task cancelled", session.log_prefix())
+            logger.info("%s [TTS] stream_text task cancelled", 
+                        session.log_prefix())
+            raise
         except TTSError:
             raise
         except Exception as e:
@@ -339,6 +501,10 @@ class AudioManager:
             # ── Unmute STT after TTS ends (barge-in, completion, or error) ───
             # The 200ms buffer lets any room echo from the speakers decay
             # before STT starts listening again.
+            # Unmute even if the sleep is cancelled by a barge-in; otherwise
+            # STT stays muted and ignores the user for the rest of the session.
             if self.stt_client:
-                await asyncio.sleep(0.2)
-                self.stt_client.unmute()
+                try:
+                    await asyncio.sleep(0.2)
+                finally:
+                    self.stt_client.unmute()

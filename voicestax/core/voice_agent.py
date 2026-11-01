@@ -20,7 +20,7 @@ from voicestax.utils.exceptions import (
     TTSError,
     WebSocketError,
 )
-from voicestax.utils.text_processing import detect_local_intent
+from voicestax.utils.text_processing import detect_local_intent,prepare_text_for_tts
 from voicestax.utils.logger import logger
 
 
@@ -80,6 +80,7 @@ class VoiceAgent:
         """Return whether the agent has requested session termination."""
         return self._session_ended
 
+    # Reset the session-ended flag when reusing the agent/session.
     def reset_session_ended(self) -> None:
         """Reset the terminal flag when reusing the agent/session."""
         self._session_ended = False
@@ -89,6 +90,7 @@ class VoiceAgent:
             self.session.log_prefix(),
         )
 
+    # Handle a single user transcript, including barge-in, local intents, LLM call, and TTS streaming.
     async def handle_user_message(
         self,
         text: str,
@@ -228,8 +230,12 @@ class VoiceAgent:
                     self.session.log_prefix(),
                     intent,
                 )
+                
+                # Prepare the LLM response for speech.
+                response = prepare_text_for_tts(response)
 
             except asyncio.TimeoutError:
+                self.session.cancel_event.set()
                 logger.error(
                     "%s [VoiceAgent] LLM request timed out after %.2f seconds",
                     self.session.log_prefix(),
@@ -254,7 +260,10 @@ class VoiceAgent:
                 self.session.log_prefix(),
             )
             return
-
+        
+        # Prepare the LLM response for speech and display.
+        response = prepare_text_for_tts(response)
+        
         # Send the assistant text to the frontend before audio streaming.
         try:
             await websocket.send_json(
@@ -310,6 +319,11 @@ class VoiceAgent:
             websocket=websocket,
             text=response,
         )
+        
+        logger.debug(
+            "%s [VoiceAgent] TTS streaming returned",
+            self.session.log_prefix(),
+        )
 
         self.session.set_state("listening")
 
@@ -317,7 +331,8 @@ class VoiceAgent:
             "%s [VoiceAgent] Normal response completed",
             self.session.log_prefix(),
         )
-
+    
+    # Handle terminal responses such as ending the session or human handoff.
     async def _handle_terminal_response(
         self,
         websocket: WebSocket,
@@ -392,19 +407,13 @@ class VoiceAgent:
             )
 
         self._session_ended = True
-
+    
+    # Handles the streaming of TTS audio and tracks the task.
     async def _stream_and_track(
         self,
         websocket: WebSocket,
         text: str,
     ) -> None:
-        """
-        Stream TTS through a tracked asyncio task.
-
-        The tracked task can be cancelled immediately by _cancel_tts()
-        when barge-in is detected.
-        """
-
         tts_task = asyncio.create_task(
             self.audio_manager.stream_text(
                 websocket=websocket,
@@ -428,6 +437,7 @@ class VoiceAgent:
                 "%s [VoiceAgent] TTS task cancelled",
                 self.session.log_prefix(),
             )
+            raise
 
         except TTSError as exc:
             logger.error(
@@ -455,10 +465,6 @@ class VoiceAgent:
                 )
 
         finally:
-            # Clear only if this is still the currently tracked task.
-            #
-            # This prevents an older task from clearing a newer task
-            # reference during a cancellation race.
             if self._tts_task is tts_task:
                 self._tts_task = None
 
@@ -467,6 +473,7 @@ class VoiceAgent:
                 self.session.log_prefix(),
             )
 
+    # Handles the cancellation of active TTS during barge-in.
     async def _cancel_tts(
         self,
         websocket: WebSocket,
@@ -530,8 +537,8 @@ class VoiceAgent:
                 )
 
         # Verify the task instance and clear it.
-        if self._tts_task is current_tts_task:
-            self._tts_task = None
+        # if self._tts_task is current_tts_task:
+        #     self._tts_task = None
 
         # Immediately stop playback and clear browser-side audio buffers.
         if send_stop_audio:

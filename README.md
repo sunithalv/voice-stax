@@ -264,7 +264,7 @@ settings = VoiceSettings(
 
     llm_provider="groq",
     llm_config={
-        "model": "llama-3.3-70b-versatile",
+        "model": "qwen/qwen3.8-27b",
         "max_tokens": 120,
     },
 
@@ -707,7 +707,7 @@ settings = VoiceSettings(
 
     llm_provider="groq",
     llm_config={
-        "model": "llama-3.3-70b-versatile",
+        "model": "qwen/qwen3.8-27b",
         "max_tokens": 120,
     },
 

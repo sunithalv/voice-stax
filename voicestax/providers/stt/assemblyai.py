@@ -19,7 +19,6 @@ from urllib.parse import urlencode
 import websockets
 
 from voicestax.providers.stt.base import BaseSTTProvider
-from voicestax.utils import session
 from voicestax.utils.exceptions import (
     STTConnectionError,
     STTError,
@@ -82,7 +81,10 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         "formatted_transcript_wait_ms",
     }
 
-    def __init__(self, api_key: str, **kwargs: Any):
+    def __init__(self, 
+                 api_key: str, 
+                 log_prefix: str, 
+                 **kwargs: Any):
         """
         Initialize the AssemblyAI provider.
 
@@ -97,6 +99,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             )
 
         self.api_key = api_key
+        self.log_prefix = log_prefix
 
         # Provider defaults can be overridden by values supplied through
         # VoiceSettings.stt_config.
@@ -138,10 +141,11 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         self._stream_task: Optional[asyncio.Task] = None
         self._cancel_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
-
+        self._force_endpoint_lock=asyncio.Lock()
+        
         logger.debug(
             "%s [AssemblyAI] Connection configuration keys: %s",
-            session.get_log_prefix(),
+            self.log_prefix,
             sorted(
                 key
                 for key in self.config
@@ -243,18 +247,18 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         self._muted = True
         self._last_partial = ""
 
-        logger.debug(
-            "%s [AssemblyAI] Microphone muted",
-            session.get_log_prefix(),
+        logger.warning(
+        "%s [AssemblyAI] MUTE called; provider is now muted",
+        self.log_prefix,
         )
 
     def unmute(self) -> None:
         """Resume microphone audio after TTS finishes."""
         self._muted = False
 
-        logger.debug(
-            "%s [AssemblyAI] Microphone unmuted",
-            session.get_log_prefix(),
+        logger.warning(
+        "%s [AssemblyAI] UNMUTE called; provider is now unmuted",
+        self.log_prefix,
         )
 
     async def send_audio(self, audio_chunk: bytes) -> None:
@@ -276,14 +280,14 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             logger.debug(
                 "%s [AssemblyAI] Ignoring audio; "
                 "provider is not actively streaming",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
             return
 
         if self._muted:
             logger.debug(
                 "%s [AssemblyAI] Ignoring audio; provider is muted",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
             return
 
@@ -293,6 +297,16 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             )
 
         async with self._send_lock:
+            if self._muted:
+                logger.debug(
+                    "%s [AssemblyAI] Ignoring audio; provider was muted "
+                    "before the audio could be sent",
+                    self.log_prefix,
+                )
+                return
+
+            if not self.is_streaming or self._ws is None:
+                return
             try:
                 # AssemblyAI v3 accepts raw binary audio frames.
                 await self._ws.send(audio_chunk)
@@ -304,7 +318,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
                 logger.error(
                     "%s [AssemblyAI] WebSocket closed while "
                     "sending audio: %s",
-                    session.get_log_prefix(),
+                    self.log_prefix,
                     exc,
                 )
 
@@ -315,7 +329,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             except Exception as exc:
                 logger.exception(
                     "%s [AssemblyAI] Audio send failed",
-                    session.get_log_prefix(),
+                    self.log_prefix,
                 )
 
                 raise STTStreamingError(
@@ -338,7 +352,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             logger.debug(
                 "%s [AssemblyAI] start_streaming ignored; "
                 "provider is already listening",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
             return
 
@@ -366,7 +380,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
         logger.info(
             "%s [AssemblyAI] Streaming task started",
-            session.get_log_prefix(),
+            self.log_prefix,
         )
 
     def stop_streaming(self) -> None:
@@ -381,7 +395,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             logger.debug(
                 "%s [AssemblyAI] stop_streaming ignored; "
                 "provider is already stopped",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
             return
 
@@ -391,7 +405,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
         logger.info(
             "%s [AssemblyAI] Streaming stop requested",
-            session.get_log_prefix(),
+            self.log_prefix,
         )
 
     def _build_stream_url(self) -> str:
@@ -435,12 +449,12 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
         logger.info(
             "%s [AssemblyAI] Connecting to streaming service",
-            session.get_log_prefix(),
+            self.log_prefix,
         )
 
         logger.debug(
             "%s [AssemblyAI] Connection configuration keys: %s",
-            session.get_log_prefix(),
+            self.log_prefix,
             sorted(
                 key
                 for key in self.config
@@ -460,7 +474,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
                 logger.info(
                     "%s [AssemblyAI] WebSocket connected",
-                    session.get_log_prefix(),
+                    self.log_prefix,
                 )
 
                 while self._is_listening:
@@ -488,7 +502,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
                     if cancel_task in done:
                         logger.info(
                             "%s [AssemblyAI] Cancellation received",
-                            session.get_log_prefix(),
+                            self.log_prefix,
                         )
 
                         await self._terminate_session(websocket)
@@ -504,7 +518,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
                         logger.error(
                             "%s [AssemblyAI] WebSocket closed while "
                             "receiving: %s",
-                            session.get_log_prefix(),
+                            self.log_prefix,
                             exc,
                         )
 
@@ -518,7 +532,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
                     except Exception as exc:
                         logger.exception(
                             "%s [AssemblyAI] Receive failed",
-                            session.get_log_prefix(),
+                            self.log_prefix,
                         )
 
                         on_error(
@@ -542,7 +556,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         except Exception as exc:
             logger.exception(
                 "%s [AssemblyAI] Streaming connection failed",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
 
             # Avoid reporting a second error if the receive loop already
@@ -572,7 +586,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
             logger.info(
                 "%s [AssemblyAI] WebSocket closed and provider reset",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
 
     async def _terminate_session(self, websocket) -> None:
@@ -582,14 +596,14 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             await websocket.send(
                 json.dumps(
                     {
-                        "terminate_session": True,
+                        "type": "Terminate",
                     }
                 )
             )
 
             logger.debug(
                 "%s [AssemblyAI] Termination message sent",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
 
         except Exception as exc:
@@ -597,7 +611,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             # connection. Cleanup still continues in the caller.
             logger.debug(
                 "%s [AssemblyAI] Could not send termination message: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 exc,
             )
 
@@ -613,14 +627,14 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             except UnicodeDecodeError:
                 logger.warning(
                     "%s [AssemblyAI] Ignoring non-UTF-8 message",
-                    session.get_log_prefix(),
+                    self.log_prefix,
                 )
                 return None
 
         if not isinstance(message, str):
             logger.warning(
                 "%s [AssemblyAI] Ignoring unexpected message type: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 type(message).__name__,
             )
             return None
@@ -631,7 +645,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         except json.JSONDecodeError:
             logger.warning(
                 "%s [AssemblyAI] Ignoring invalid JSON message: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 message[:200],
             )
             return None
@@ -639,14 +653,14 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         if not isinstance(data, dict):
             logger.warning(
                 "%s [AssemblyAI] Ignoring non-object message: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 type(data).__name__,
             )
             return None
 
         logger.debug(
             "%s [AssemblyAI] Received message type=%s",
-            session.get_log_prefix(),
+            self.log_prefix,
             data.get("type"),
         )
 
@@ -661,12 +675,29 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         """Handle one parsed AssemblyAI server message."""
 
         message_type = data.get("type", "")
+        
+        logger.debug(
+            "%s [AssemblyAI] Event=%s text=%r "
+            "end_of_turn=%s turn_is_formatted=%s",
+            self.log_prefix,
+            message_type,
+            data.get("text", data.get("transcript", "")),
+            data.get("end_of_turn"),
+            data.get("turn_is_formatted"),
+        )
 
         if message_type == "Begin":
             logger.info(
                 "%s [AssemblyAI] Session began: id=%s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 data.get("id"),
+            )
+            return
+        
+        if message_type == "SpeechStarted":
+            logger.debug(
+                "%s [AssemblyAI] Speech detected",
+                self.log_prefix,
             )
             return
 
@@ -678,10 +709,9 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
                 logger.debug(
                     "%s [AssemblyAI] Partial transcript: %s",
-                    session.get_log_prefix(),
+                    self.log_prefix,
                     text,
                 )
-
                 on_transcript(text, False)
 
             return
@@ -696,7 +726,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         if message_type == "Termination":
             logger.info(
                 "%s [AssemblyAI] Server terminated session: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 data,
             )
 
@@ -711,7 +741,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
             logger.error(
                 "%s [AssemblyAI] Provider error: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 error_message,
             )
 
@@ -721,7 +751,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
         logger.debug(
             "%s [AssemblyAI] Unhandled message type: %s",
-            session.get_log_prefix(),
+            self.log_prefix,
             message_type,
         )
 
@@ -742,7 +772,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         if not transcript:
             logger.debug(
                 "%s [AssemblyAI] Final Turn contained no transcript",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
             return
 
@@ -779,7 +809,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             logger.debug(
                 "%s [AssemblyAI] Cancelled pending unformatted "
                 "transcript because formatted transcript arrived",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
 
         self._pending_unformatted = ""
@@ -787,10 +817,10 @@ class AssemblyAISTTProvider(BaseSTTProvider):
 
         logger.info(
             "%s [AssemblyAI] Final formatted transcript: %s",
-            session.get_log_prefix(),
+            self.log_prefix,
             transcript,
         )
-
+        logger.info("[STT] Final transcript source: handle_formatted_turn")
         on_transcript(transcript, True)
 
     async def _handle_unformatted_turn(
@@ -823,7 +853,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         logger.debug(
             "%s [AssemblyAI] Holding unformatted final transcript "
             "for %sms: %s",
-            session.get_log_prefix(),
+            self.log_prefix,
             self.formatted_transcript_wait_ms,
             transcript,
         )
@@ -839,76 +869,97 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         the latest partial transcript can optionally be emitted through
         fallback_callback.
         """
-
-        if self._ws is None or not self.is_streaming:
-            logger.debug(
-                "%s [AssemblyAI] force_end_turn ignored; "
-                "WebSocket is not active",
-                session.get_log_prefix(),
-            )
-            return
-
-        try:
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "type": "ForceEndpoint",
-                    }
+        async with self._force_endpoint_lock:
+            if self._ws is None or not self.is_streaming:
+                logger.debug(
+                    "%s [AssemblyAI] force_end_turn ignored; "
+                    "WebSocket is not active",
+                    self.log_prefix,
                 )
-            )
+                return
 
-            logger.info(
-                "%s [AssemblyAI] ForceEndpoint sent",
-                session.get_log_prefix(),
-            )
+            try:
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "type": "ForceEndpoint",
+                        }
+                    )
+                )
 
-            partial_at_interrupt = self._last_partial
-
-            # Give AssemblyAI time to return the final turn.
-            await asyncio.sleep(
-                self.min_end_of_turn_silence_when_confident / 1000
-            )
-
-            if (
-                partial_at_interrupt
-                and self._last_partial == partial_at_interrupt
-                and fallback_callback
-            ):
                 logger.info(
-                    "%s [AssemblyAI] No final transcript received; "
-                    "using latest partial as fallback: %s",
-                    session.get_log_prefix(),
+                    "%s [AssemblyAI] ForceEndpoint sent",
+                    self.log_prefix,
+                )
+
+                partial_at_interrupt = self._last_partial
+                
+                logger.debug(
+                    "%s [AssemblyAI] Before fallback wait; last_partial=%r",
+                    self.log_prefix,
                     self._last_partial,
                 )
 
-                fallback_callback(
+                # Give AssemblyAI time to return the final turn.
+                await asyncio.sleep(
+                    self.min_end_of_turn_silence_when_confident / 1000
+                )
+                
+                logger.debug(
+                    "%s [AssemblyAI] After fallback wait; last_partial=%r",
+                    self.log_prefix,
                     self._last_partial,
-                    True,
                 )
 
-                self._last_partial = ""
+                if (
+                    partial_at_interrupt
+                    and self._last_partial == partial_at_interrupt
+                    and fallback_callback
+                ):
+                    logger.info(
+                        "%s [AssemblyAI] No final transcript received; "
+                        "using latest partial as fallback: %s",
+                        self.log_prefix,
+                        partial_at_interrupt,
+                    )
+                    
+                    # Prevent the pending unformatted handler from emitting
+                    # the same transcript after the fallback.
 
-        except websockets.exceptions.ConnectionClosed as exc:
-            logger.error(
-                "%s [AssemblyAI] force_end_turn failed because "
-                "WebSocket is closed: %s",
-                session.get_log_prefix(),
-                exc,
-            )
+                    if self._pending_unformatted == partial_at_interrupt:
+                        if (
+                            self._pending_unformatted_task
+                            and not self._pending_unformatted_task.done()
+                        ):
+                            self._pending_unformatted_task.cancel()
 
-            raise STTConnectionError(
-                f"AssemblyAI WebSocket closed during force_end_turn: {exc}"
-            ) from exc
+                        self._pending_unformatted_task = None
+                        self._pending_unformatted = ""
 
-        except Exception as exc:
-            logger.exception(
-                "%s [AssemblyAI] force_end_turn failed",
-                session.get_log_prefix(),
-            )
+                    self._last_partial = ""
+                    fallback_callback(partial_at_interrupt, True)
 
-            raise STTStreamingError(
-                f"AssemblyAI force_end_turn failed: {exc}"
-            ) from exc
+            except websockets.exceptions.ConnectionClosed as exc:
+                logger.error(
+                    "%s [AssemblyAI] force_end_turn failed because "
+                    "WebSocket is closed: %s",
+                    self.log_prefix,
+                    exc,
+                )
+
+                raise STTConnectionError(
+                    f"AssemblyAI WebSocket closed during force_end_turn: {exc}"
+                ) from exc
+
+            except Exception as exc:
+                logger.exception(
+                    "%s [AssemblyAI] force_end_turn failed",
+                    self.log_prefix,
+                )
+
+                raise STTStreamingError(
+                    f"AssemblyAI force_end_turn failed: {exc}"
+                ) from exc
 
     async def _emit_if_no_formatted(
         self,
@@ -928,7 +979,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             if self._pending_unformatted != transcript:
                 logger.debug(
                     "%s [AssemblyAI] Skipping stale unformatted transcript",
-                    session.get_log_prefix(),
+                    self.log_prefix,
                 )
                 return
 
@@ -938,17 +989,17 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             logger.info(
                 "%s [AssemblyAI] No formatted transcript arrived "
                 "within %sms; emitting unformatted transcript: %s",
-                session.get_log_prefix(),
+                self.log_prefix,
                 self.formatted_transcript_wait_ms,
                 transcript,
             )
-
+            logger.info("[STT] Final transcript source: emit_if_no_formatted")
             on_transcript(transcript, True)
 
         except asyncio.CancelledError:
             logger.debug(
                 "%s [AssemblyAI] Pending unformatted transcript "
                 "task cancelled",
-                session.get_log_prefix(),
+                self.log_prefix,
             )
             raise

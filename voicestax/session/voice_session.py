@@ -151,7 +151,7 @@ class SessionData:
         )
         self.state = "idle"
         self.is_speaking = False
-        self.current_response_id = 0
+        #self.current_response_id = 0
 
         self.was_interrupted = False
         self.ignore_barge_in_once = False
