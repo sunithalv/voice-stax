@@ -7,6 +7,7 @@ from starlette.websockets import WebSocketState
 import asyncio
 import json
 import time
+from collections import deque
 from voicestax.session.voice_session import SessionData
 from voicestax.core.voice_agent import VoiceAgent
 from voicestax.core.chat_engine import ChatEngine
@@ -17,7 +18,7 @@ from voicestax.providers.stt.factory import get_stt_provider
 from voicestax.providers.tts.factory import get_tts_provider
 from voicestax.providers.llm.factory import get_llm_provider
 from voicestax.providers.vad.factory import get_vad_provider
-from voicestax.utils.exceptions import ProviderInitializationError, WebSocketError, WebSocketConnectionError,TTSError
+from voicestax.utils.exceptions import ProviderInitializationError, WebSocketError, WebSocketConnectionError,TTSError, STTConnectionError
 from voicestax.utils.logger import logger
 
 
@@ -137,6 +138,8 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
             #Stores speech frames that will be sent to stt.
             stt_send_buffer = bytearray()
             
+            barge_in_confirmed = False
+            
             # Initialize the VADManager with the configured thresholds and durations
             vad_manager = VADManager(
                 silence_threshold_ms=settings.vad_silence_threshold_ms, 
@@ -172,7 +175,11 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
             except Exception as e:
                 logger.error(f"WebSocket error sending error message: {e}")
                 
-        async def _process_final_transcript(text: str) -> None:
+        async def _process_final_transcript(
+            text: str,
+            speech_end_time: float,
+            stt_final_time: float,
+        ) -> None:
             """Process a final STT transcript in a predictable order."""
 
             try:
@@ -186,17 +193,28 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                 )
 
             # Continue processing even if displaying the transcript failed.
-            await _handle_message(text)
+            await _handle_message(text, speech_end_time, stt_final_time)
 
-
+        # Callback for receiving final transcripts from the STT provider
         def on_transcript(text: str, is_final: bool) -> None:
             """Receive transcript callbacks from the STT provider."""
 
             if not text or not is_final:
                 return
 
-            session.stt_final_time = time.perf_counter()
-            
+            stt_final_time = time.perf_counter()
+
+            if pending_speech_end_times:
+                speech_end_time = pending_speech_end_times.popleft()
+            else:
+                speech_end_time = 0.0
+
+                logger.warning(
+                    "%s [STT] Final transcript received without a pending "
+                    "speech-end timestamp",
+                    session.log_prefix(),
+                )
+
             logger.info(
                 "%s [STT] Final transcript received: %s",
                 session.log_prefix(),
@@ -204,40 +222,115 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
             )
 
             asyncio.create_task(
-                _process_final_transcript(text)
+                _process_final_transcript(
+                    text,
+                    speech_end_time,
+                    stt_final_time,
+                )
             )
         
         # Callback for handling errors from the STT provider
+        stt_reconnecting = False
+
+        async def _reconnect_stt() -> None:
+            """Re-open the STT stream after the provider connection drops."""
+            nonlocal stt_reconnecting
+            if stt_reconnecting:
+                return
+            stt_reconnecting = True
+            try:
+                for attempt in range(1, 4):
+                    # Let the old stream task finish its cleanup first.
+                    old_task = getattr(session.stt_provider, "_stream_task", None)
+                    if old_task is not None and not old_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(old_task), 5)
+                        except Exception:
+                            pass
+
+                    logger.warning(
+                        "%s [STT] Reconnecting (attempt %d/3)",
+                        log_prefix,
+                        attempt,
+                    )
+                    session.stt_provider.start_streaming(
+                        on_transcript=on_transcript,
+                        on_error=on_error,
+                    )
+
+                    for _ in range(300):
+                        if session.stt_provider.is_ready:
+                            break
+                        await asyncio.sleep(0.05)
+
+                    if session.stt_provider.is_ready:
+                        logger.info("%s [STT] Reconnected", log_prefix)
+                        return
+
+                    await asyncio.sleep(attempt)
+
+                logger.error("%s [STT] Reconnect failed", log_prefix)
+            finally:
+                stt_reconnecting = False
+
         def on_error(e: Exception):
             asyncio.create_task(send_error_message(str(e)))
+            if isinstance(e, STTConnectionError) and conversation_started:
+                asyncio.create_task(_reconnect_stt())
 
         # Helper function to handle user messages, send them to the agent, and manage session state
-        async def _handle_message(text: str):
+        async def _handle_message(
+            text: str,
+            speech_end_time: float,
+            stt_final_time: float,
+        ):
             nonlocal stt_accepting, conversation_started
             logger.info(
                 "%s User message received: %s",
                 log_prefix,
                 text,
             )
-            if session.speech_end_time:
-                # Calculate STT latency in milliseconds
-                stt_latency = (
-                    session.stt_final_time - session.speech_end_time
-                ) * 1000
-
-                session.record_latency(
-                    "stt_latency",
-                    round(stt_latency, 2)
+            if speech_end_time > 0:
+                session.start_turn_latency(
+                    speech_end_time,
+                    stt_final_time,
                 )
+            else:
+                # Keep the turn metrics valid without reporting a false STT latency.
+                logger.warning(
+                    "%s [STT] Cannot calculate STT latency: "
+                    "speech-end timestamp is unavailable",
+                    log_prefix,
+                )
+
+                session.start_turn_latency(
+                    stt_final_time,
+                    stt_final_time,
+                )
+
+            stt_latency = (
+                stt_final_time - speech_end_time
+            ) * 1000 if speech_end_time > 0 else 0.0
                 
-                logger.info(
-                    "%s [STT] Final transcript received: %s | latency=%.2f ms",
-                    session.log_prefix(),
-                    text,
-                    stt_latency,
-                )
+            logger.info(
+                "%s [STT] Final transcript received: %s | latency=%.2f ms",
+                session.log_prefix(),
+                text,
+                stt_latency,
+            )
 
-            await agent.handle_user_message(text, websocket)
+            try:
+                await agent.handle_user_message(text, websocket)
+            finally:
+                metrics = session.finish_turn_latency()
+                logger.info(
+                    "%s LATENCY | STT=%.2fms | LLM=%.2fms | TTS=%.2fms | TOTAL=%.2fms",
+                    log_prefix,
+                    metrics.get("stt_latency", 0),
+                    metrics.get("llm_latency", 0),
+                    metrics.get("tts_latency", 0),
+                    metrics.get("total_turn_latency", 0),
+                )
 
             if agent.session_ended:
                 logger.info(
@@ -261,15 +354,6 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                     await websocket.send_json({"type": "session_ended"})
                 except Exception as e:
                     raise WebSocketError(f"Failed to send session_ended: {e}") from e
-            logger.info(
-                "%s LATENCY | STT=%.2fms | LLM=%.2fms | "
-                "TTS=%.2fms | TOTAL=%.2fms",
-                log_prefix,
-                session.latency_metrics.get("stt_latency", 0),
-                session.latency_metrics.get("llm_latency", 0),
-                session.latency_metrics.get("tts_latency", 0),
-                session.latency_metrics.get("total_turn_latency", 0),
-            )
 
         # Process incoming PCM audio through VAD, stream detected speech
         # frames to STT in batches, handle speech state transitions and
@@ -280,8 +364,12 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
         # otherwise real sentences get chopped into fragments like "Oh."
         endpoint_speech_frames = 0
         MIN_ENDPOINT_SPEECH_FRAMES = 10  # 200 ms at 20 ms frames
+        BARGE_IN_MIN_FRAMES = 25  # 500 ms of sustained speech to interrupt TTS
         # Strong references so background endpoint tasks aren't garbage-collected.
         endpoint_tasks: set[asyncio.Task] = set()
+        
+        # Speech-end timestamps waiting for their corresponding final STT transcripts.
+        pending_speech_end_times = deque()
         
         force_endpoint_in_progress = False
 
@@ -303,14 +391,40 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                 log_prefix,
                 (time.perf_counter() - force_endpoint_start) * 1000,
             )
+        
+        # Helper function to check if STT can receive audio (ready and not muted)
+        def _stt_can_receive_audio() -> bool:
+            return (
+                session.stt_provider.is_ready
+                and not session.stt_provider.is_muted
+            )
+
+        # Wait for STT to become unmuted and ready after a barge-in event, with a timeout.
+        async def _wait_for_stt_ready_after_barge_in(
+            timeout: float = 3.0,
+        ) -> bool:
+            deadline = asyncio.get_running_loop().time() + timeout
+
+            while asyncio.get_running_loop().time() < deadline:
+                if _stt_can_receive_audio():
+                    return True
+
+                await asyncio.sleep(0.01)
+
+            logger.warning(
+                "%s [STT] Timed out waiting for STT to become unmuted and ready",
+                log_prefix,
+            )
+            return False
 
         async def send_audio_to_stt(pcm_bytes: bytes):
-            nonlocal barge_in_speech_frames, endpoint_speech_frames
+            nonlocal barge_in_speech_frames
+            nonlocal endpoint_speech_frames
+            nonlocal barge_in_confirmed
             try:
                 
                 # Process through VAD
                 vad_buffer.extend(pcm_bytes)
-                logger.debug(f"PCM chunk size: {len(pcm_bytes)}")
                 
                 while len(vad_buffer) >= FRAME_SIZE:
                     frame = bytes(vad_buffer[:FRAME_SIZE])
@@ -320,18 +434,13 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
 
                     events = vad_manager.process_frame(is_speech)
 
-                    logger.debug(
-                        "%s VAD frame classified as %s",
-                        log_prefix,
-                        "speech" if is_speech else "silence",
-                    )
-
                     # Buffer speech audio for STT.
                     if is_speech:
                         endpoint_speech_frames += 1
                         stt_send_buffer.extend(frame)
 
-                        if len(stt_send_buffer) >= 3200:
+                        if (len(stt_send_buffer) >= 3200
+                            and _stt_can_receive_audio()):
                             logger.debug(
                                 "%s Sending %d bytes to STT",
                                 log_prefix,
@@ -341,10 +450,13 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                             await session.stt_provider.send_audio(
                                 bytes(stt_send_buffer)
                             )
-                            stt_send_buffer.clear()
 
+                            stt_send_buffer.clear()
                     # Speech-start event: log the transition.
                     if "speech_started" in events:
+                        # A new utterance began; drop the previous end time so
+                        # latency metrics are never measured from a stale one.
+                        session.speech_end_time = 0.0
                         logger.info(
                             "%s [VAD] Speech started state=%s",
                             log_prefix,
@@ -362,19 +474,12 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                         # Any silence or non-speaking state breaks the sequence.
                         barge_in_speech_frames = 0
                     
-                    if session.state == "speaking" and session.is_speaking:
-                        logger.debug(
-                            "%s [BARGE-IN DEBUG] is_speech=%s consecutive_frames=%d",
-                            log_prefix,
-                            is_speech,
-                            barge_in_speech_frames,
-                        )
                     # Require sustained speech before interrupting TTS.
-                    # For 20 ms VAD frames, 15 frames = 300 ms.
+                    # For 20 ms VAD frames, 25 frames = 500 ms.
                     if (
                         session.state == "speaking"
                         and session.is_speaking
-                        and barge_in_speech_frames >= 15
+                        and barge_in_speech_frames >= BARGE_IN_MIN_FRAMES
                     ):
                         logger.info(
                             "%s [BARGE-IN] consecutive_speech_frames=%d state=%s",
@@ -382,7 +487,7 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                             barge_in_speech_frames,
                             session.state,
                         )
-
+                        barge_in_confirmed = True
                         await agent._cancel_tts(
                             websocket,
                             send_stop_audio=True,
@@ -390,8 +495,27 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
 
                         session.set_state("listening")
                         barge_in_speech_frames = 0
-                        # Do not reset vad_manager here.
-                        # Continue tracking this same user utterance.
+                        # Wait until AudioManager has completed TTS cleanup
+                        # and unmuted the STT provider.
+                        if await _wait_for_stt_ready_after_barge_in():
+
+                            if stt_send_buffer:
+                                logger.info(
+                                    "%s [BARGE-IN] Replaying %d buffered bytes to STT",
+                                    log_prefix,
+                                    len(stt_send_buffer),
+                                )
+
+                                await session.stt_provider.send_audio(
+                                    bytes(stt_send_buffer)
+                                )
+
+                                stt_send_buffer.clear()
+
+                                logger.info(
+                                    "%s [BARGE-IN] Buffered audio replay complete",
+                                    log_prefix,
+                                )
                     
                     # Maximum segment duration: flush audio, but do NOT end the STT turn.
                     if "max_utterance" in events:
@@ -401,7 +525,7 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                             log_prefix,
                         )
 
-                        if stt_send_buffer:
+                        if stt_send_buffer and _stt_can_receive_audio():
                             if len(stt_send_buffer) < 1600:
                                 stt_send_buffer.extend(
                                     b"\x00" * (1600 - len(stt_send_buffer))
@@ -412,10 +536,41 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                     
                     # Genuine speech end: flush audio and finalize the STT turn.
                     if "speech_ended" in events:
+                        # Discard speech only if it was NOT a confirmed barge-in.
+                        if session.state == "speaking" and not barge_in_confirmed:
+                            logger.debug(
+                                "%s [VAD] Speech ended while assistant speaking; "
+                                "discarding unconfirmed audio",
+                                log_prefix,
+                            )
+
+                            stt_send_buffer.clear()
+                            endpoint_speech_frames = 0
+                            continue
+
                         session.speech_end_time = time.perf_counter()
 
-                        logger.info("%s [VAD] Speech ended", log_prefix)
+                        logger.info(
+                            "%s [VAD] Speech ended",
+                            log_prefix,
+                        )
 
+                        # Make sure STT is ready before sending buffered audio.
+                        if not _stt_can_receive_audio():
+                            logger.info(
+                                "%s [STT] Waiting for provider to become ready "
+                                "before flushing buffered speech",
+                                log_prefix,
+                            )
+
+                            if not await _wait_for_stt_ready_after_barge_in():
+                                logger.warning(
+                                    "%s [STT] Provider not ready; retaining buffered audio",
+                                    log_prefix,
+                                )
+                                continue
+
+                        # Flush the remaining speech audio.
                         if stt_send_buffer:
                             if len(stt_send_buffer) < 1600:
                                 stt_send_buffer.extend(
@@ -423,26 +578,38 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                                 )
 
                             logger.info(
-                                "%s Flushing %d bytes to STT",
+                                "%s [STT] Sending final buffered audio: %d bytes",
                                 log_prefix,
                                 len(stt_send_buffer),
                             )
 
-                            await session.stt_provider.send_audio(bytes(stt_send_buffer))
+                            await session.stt_provider.send_audio(
+                                bytes(stt_send_buffer)
+                            )
+
                             stt_send_buffer.clear()
 
                         speech_frames_in_turn = endpoint_speech_frames
                         endpoint_speech_frames = 0
 
+                        # Reset only after the utterance has been flushed.
+                        barge_in_confirmed = False
+
                         if speech_frames_in_turn < MIN_ENDPOINT_SPEECH_FRAMES:
                             logger.debug(
-                                "%s Skipping ForceEndpoint for short speech burst (%d frames)",
+                                "%s [VAD] Speech too short for ForceEndpoint: %d frames",
                                 log_prefix,
                                 speech_frames_in_turn,
                             )
                             continue
 
-                        logger.info("%s Sending ForceEndpoint to STT", log_prefix)
+                        logger.info(
+                            "%s Sending ForceEndpoint to STT",
+                            log_prefix,
+                        )
+
+                        # Save this utterance's speech-end time before requesting finalization.
+                        pending_speech_end_times.append(session.speech_end_time)
 
                         task = asyncio.create_task(_force_end_turn())
                         endpoint_tasks.add(task)
@@ -453,6 +620,8 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                     "%s Audio processing failed ",
                     log_prefix
                 )
+                if isinstance(e, STTConnectionError) and conversation_started:
+                    asyncio.create_task(_reconnect_stt())
 
         # Main loop 
         try:
@@ -560,6 +729,13 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                                 log_prefix,
                             )
                             break
+                    if not session.stt_provider.is_ready:
+                        logger.error(
+                            "%s [Router] STT connection failed. "
+                            "Ending session startup.",
+                            log_prefix,
+                        )
+                        break
                     # Previously stored user audio before the STT provider became ready
                     if early_audio_buffer:
                         logger.info(
@@ -603,28 +779,28 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                     break
                 
                 # User interrupts the assistant while it is speaking. Stops TTS and resets VAD and buffers.
-                elif data.get("type") == "interrupt":
-                    logger.info(
-                        "%s [BARGE-IN] Interrupt received",
-                        log_prefix,
-                    )
-                    await agent._cancel_tts(websocket, send_stop_audio=True)
-                    vad_manager.reset()
-                    vad_buffer.clear()
-                    stt_send_buffer.clear()
-                    session.set_state("listening")
+                # elif data.get("type") == "interrupt":
+                #     logger.info(
+                #         "%s [BARGE-IN] Interrupt received",
+                #         log_prefix,
+                #     )
+                #     await agent._cancel_tts(websocket, send_stop_audio=True)
+                #     vad_manager.reset()
+                #     vad_buffer.clear()
+                #     stt_send_buffer.clear()
+                #     session.set_state("listening")
                     
-                    # This handles cases where STT websocket closed during interrupt.
-                    if not session.stt_provider.is_listening or not session.stt_provider.is_ready:
-                        session.stt_provider.start_streaming(
-                            on_transcript=on_transcript,
-                            on_error=on_error,
-                        )
-                        # Timeout of 3 seconds for STT to be ready after an interrupt
-                        for _ in range(60):
-                            if session.stt_provider.is_ready:
-                                break
-                            await asyncio.sleep(0.05)
+                #     # This handles cases where STT websocket closed during interrupt.
+                #     if not session.stt_provider.is_listening or not session.stt_provider.is_ready:
+                #         session.stt_provider.start_streaming(
+                #             on_transcript=on_transcript,
+                #             on_error=on_error,
+                #         )
+                #         # Timeout of 3 seconds for STT to be ready after an interrupt
+                #         for _ in range(60):
+                #             if session.stt_provider.is_ready:
+                #                 break
+                #             await asyncio.sleep(0.05)
 
         except WebSocketDisconnect:
             logger.info(
@@ -671,7 +847,7 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
             vad_manager.reset()
             vad_buffer.clear()
             stt_send_buffer.clear()
-            if session.stt_provider and session.stt_provider.is_listening:
+            if session.stt_provider and session.stt_provider.is_listening():
                 session.stt_provider.stop_streaming()
             session.reset_session()
             if websocket.client_state != WebSocketState.DISCONNECTED:

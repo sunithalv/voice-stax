@@ -223,6 +223,10 @@ class AssemblyAISTTProvider(BaseSTTProvider):
     def is_ready(self) -> bool:
         """Return True when the AssemblyAI WebSocket is connected."""
         return self.is_streaming
+    
+    @property
+    def is_muted(self) -> bool:
+        return self._muted
 
     def validate_api_key(self) -> bool:
         """
@@ -277,18 +281,9 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             or self._ws is None
             or not self._is_listening
         ):
-            logger.debug(
-                "%s [AssemblyAI] Ignoring audio; "
-                "provider is not actively streaming",
-                self.log_prefix,
-            )
             return
 
         if self._muted:
-            logger.debug(
-                "%s [AssemblyAI] Ignoring audio; provider is muted",
-                self.log_prefix,
-            )
             return
 
         if not isinstance(audio_chunk, bytes):
@@ -702,8 +697,7 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             return
 
         if message_type == "PartialTranscript":
-            text = data.get("text", "").strip()
-
+            text = data.get("text", data.get("transcript", "")).strip()           
             if text:
                 self._last_partial = text
 
@@ -755,41 +749,48 @@ class AssemblyAISTTProvider(BaseSTTProvider):
             message_type,
         )
 
-    async def _handle_turn(
-        self,
-        data: dict[str, Any],
-        on_transcript: TranscriptCallback,
-    ) -> None:
-        """Handle a final or non-final AssemblyAI Turn message."""
-
+    # Handle a single turn of speech, which may be final or interim.
+    async def _handle_turn(self, data, on_transcript):
         is_final = data.get("end_of_turn", False)
 
-        if not is_final:
-            return
-
-        transcript = data.get("transcript", "").strip()
+        transcript = (
+            data.get("transcript") or data.get("text") or ""
+        ).strip()
 
         if not transcript:
             logger.debug(
-                "%s [AssemblyAI] Final Turn contained no transcript",
-                self.log_prefix,
+                "[AssemblyAI] Turn contained no transcript. "
+                "end_of_turn=%s",
+                is_final,
             )
             return
 
-        turn_is_formatted = data.get(
-            "turn_is_formatted",
-            False,
+        if not is_final:
+            # Save the latest recognised text for fallback.
+            self._last_partial = transcript
+
+            logger.debug(
+                "[AssemblyAI] Interim Turn stored: %s",
+                transcript,
+            )
+            return
+
+        logger.info(
+            "[AssemblyAI] Final Turn received: %s",
+            transcript,
         )
+
+        turn_is_formatted = data.get("turn_is_formatted", False)
 
         if turn_is_formatted:
             await self._handle_formatted_turn(
-                transcript=transcript,
-                on_transcript=on_transcript,
+                transcript,
+                on_transcript,
             )
         else:
             await self._handle_unformatted_turn(
-                transcript=transcript,
-                on_transcript=on_transcript,
+                transcript,
+                on_transcript,
             )
 
     async def _handle_formatted_turn(
@@ -869,13 +870,13 @@ class AssemblyAISTTProvider(BaseSTTProvider):
         the latest partial transcript can optionally be emitted through
         fallback_callback.
         """
+        # Skip if another ForceEndpoint is already in flight; queued
+        # duplicates only delay the final transcript.
+        if self._force_endpoint_lock.locked():
+            return
+
         async with self._force_endpoint_lock:
             if self._ws is None or not self.is_streaming:
-                logger.debug(
-                    "%s [AssemblyAI] force_end_turn ignored; "
-                    "WebSocket is not active",
-                    self.log_prefix,
-                )
                 return
 
             try:
@@ -892,52 +893,33 @@ class AssemblyAISTTProvider(BaseSTTProvider):
                     self.log_prefix,
                 )
 
-                partial_at_interrupt = self._last_partial
-                
-                logger.debug(
-                    "%s [AssemblyAI] Before fallback wait; last_partial=%r",
-                    self.log_prefix,
-                    self._last_partial,
-                )
-
-                # Give AssemblyAI time to return the final turn.
-                await asyncio.sleep(
-                    self.min_end_of_turn_silence_when_confident / 1000
-                )
-                
-                logger.debug(
-                    "%s [AssemblyAI] After fallback wait; last_partial=%r",
-                    self.log_prefix,
-                    self._last_partial,
-                )
-
-                if (
-                    partial_at_interrupt
-                    and self._last_partial == partial_at_interrupt
-                    and fallback_callback
-                ):
-                    logger.info(
-                        "%s [AssemblyAI] No final transcript received; "
-                        "using latest partial as fallback: %s",
-                        self.log_prefix,
-                        partial_at_interrupt,
-                    )
+                # if (
+                #     partial_at_interrupt
+                #     and self._last_partial == partial_at_interrupt
+                #     and fallback_callback
+                # ):
+                #     logger.info(
+                #         "%s [AssemblyAI] No final transcript received; "
+                #         "using latest partial as fallback: %s",
+                #         self.log_prefix,
+                #         partial_at_interrupt,
+                #     )
                     
-                    # Prevent the pending unformatted handler from emitting
-                    # the same transcript after the fallback.
+                #     # Prevent the pending unformatted handler from emitting
+                #     # the same transcript after the fallback.
 
-                    if self._pending_unformatted == partial_at_interrupt:
-                        if (
-                            self._pending_unformatted_task
-                            and not self._pending_unformatted_task.done()
-                        ):
-                            self._pending_unformatted_task.cancel()
+                #     if self._pending_unformatted == partial_at_interrupt:
+                #         if (
+                #             self._pending_unformatted_task
+                #             and not self._pending_unformatted_task.done()
+                #         ):
+                #             self._pending_unformatted_task.cancel()
 
-                        self._pending_unformatted_task = None
-                        self._pending_unformatted = ""
+                #         self._pending_unformatted_task = None
+                #         self._pending_unformatted = ""
 
-                    self._last_partial = ""
-                    fallback_callback(partial_at_interrupt, True)
+                #     self._last_partial = ""
+                #     fallback_callback(partial_at_interrupt, True)
 
             except websockets.exceptions.ConnectionClosed as exc:
                 logger.error(

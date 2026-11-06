@@ -22,7 +22,7 @@ class VoiceSettings(BaseSettings):
     )
 
     # VoiceStax application configuration
-    log_level: str = "DEBUG"
+    log_level: str = "INFO"
     enable_metrics: bool = True
 
     # First message configuration
@@ -103,6 +103,42 @@ class VoiceSettings(BaseSettings):
 
 
     llm_timeout_seconds: int = 20
+
+    # Fallbacks used when the LLM does not return the required
+    # {"intent", "response"} JSON, whichever provider is used.
+    # 1) Retry once, asking the model to reformat its reply as JSON.
+    llm_json_retry: bool = True
+    # 2) If that also fails, guess the intent from the user's words.
+    intent_keyword_fallback: bool = True
+    # Only short user messages are matched, to avoid false positives.
+    intent_keyword_max_words: int = 8
+
+    # Single source of truth for goodbye / handoff phrases. Used by:
+    #  - the local intent check (whole utterance must equal a phrase, no
+    #    LLM call), and
+    #  - the keyword fallback (phrase inside a short message) when the
+    #    LLM returns no intent.
+    # Keep ambiguous phrases such as "that's it" or "thanks" out of these
+    # lists; those need context and are left to the LLM.
+    end_conversation_phrases: list[str] = Field(
+        default_factory=lambda: [
+            "bye", "bye bye", "goodbye", "good bye", "see you",
+            "see you later", "talk to you later", "have a good day",
+            "have a nice day", "thanks bye", "thank you bye",
+            "you can end the call", "end the call",
+            "end the conversation", "stop the conversation",
+            "i have to go", "i need to go",
+        ]
+    )
+    human_handoff_phrases: list[str] = Field(
+        default_factory=lambda: [
+            "connect me to a human", "connect me to an agent",
+            "speak to a human", "speak to an agent", "talk to a human",
+            "talk to an agent", "transfer me to an agent",
+            "i want a human", "talk to a person", "speak to a person",
+            "real person", "human agent",
+        ]
+    )
 
     
     #Validate language field to ensure it is one of the supported languages

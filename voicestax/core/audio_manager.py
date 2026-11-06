@@ -78,6 +78,9 @@ class AudioManager:
         if not text.strip():
             return
         response_id = session.current_response_id
+        turn_latency = session.current_turn_latency
+        session.tts_generation += 1
+        tts_generation = session.tts_generation
         session.is_speaking = True
         session.tts_start_time = time.perf_counter()
         session.tts_first_chunk_time = 0.0
@@ -281,23 +284,6 @@ class AudioManager:
                     )
                     
                     
-                    # End-to-end turn latency ie from end of user speech to first TTS chunk
-                    if session.speech_end_time and session.tts_first_chunk_time:
-                        total_turn_latency = (
-                            session.tts_first_chunk_time
-                            - session.speech_end_time
-                        ) * 1000
-
-                        session.record_latency(
-                            "total_turn_latency",
-                            round(total_turn_latency, 2)
-                        )
-
-                        logger.info(
-                            "%s [LATENCY] Total turn latency: %.2f ms",
-                            session.log_prefix(),
-                            total_turn_latency,
-                        )
                 
                 # Check for cancellation (barge-in) before sending each chunk
                 if self._is_cancelled(session, response_id):
@@ -330,6 +316,26 @@ class AudioManager:
                     
                     websocket_send_end = time.perf_counter()
 
+                    # Total turn latency ends when the first audio chunk is
+                    # successfully delivered over the websocket.
+                    if (
+                        first_chunk_sent_time == 0.0
+                        and turn_latency is not None
+                        and turn_latency.get("_speech_end_time")
+                    ):
+                        total_turn_latency = (
+                            websocket_send_end - turn_latency["_speech_end_time"]
+                        ) * 1000
+                        session.record_latency(
+                            "total_turn_latency",
+                            round(total_turn_latency, 2),
+                        )
+                        logger.info(
+                            "%s [LATENCY] Total turn latency: %.2f ms",
+                            session.log_prefix(),
+                            total_turn_latency,
+                        )
+
                     logger.debug(
                         "%s [TTS TIMING] WebSocket audio chunk send took %.2f ms",
                         session.log_prefix(),
@@ -342,12 +348,6 @@ class AudioManager:
                         first_chunk_sent = True
                         first_chunk_sent_time = websocket_send_end
 
-                        logger.info(
-                            "%s [TTS TIMING] First audio chunk sent to WebSocket",
-                            session.log_prefix(),
-                        )
-
-                    if session.tts_first_chunk_time == queue_receive_time:
                         logger.info(
                             "%s [TTS TIMING] First audio chunk sent to WebSocket",
                             session.log_prefix(),
@@ -496,7 +496,7 @@ class AudioManager:
         finally:
             if response_id == session.current_response_id:
                 session.is_speaking = False
-                session.set_state("idle")
+                #session.set_state("idle")
 
             # ── Unmute STT after TTS ends (barge-in, completion, or error) ───
             # The 200ms buffer lets any room echo from the speakers decay
@@ -507,4 +507,18 @@ class AudioManager:
                 try:
                     await asyncio.sleep(0.2)
                 finally:
-                    self.stt_client.unmute()
+                    if tts_generation == session.tts_generation:
+                        self.stt_client.unmute()
+                        logger.info(
+                            "%s [STT] Unmuted by TTS generation %s",
+                            session.log_prefix(),
+                            tts_generation,
+                        )
+                    else:
+                        logger.info(
+                            "%s [STT] Skipping unmute from stale TTS generation %s; "
+                            "current generation is %s",
+                            session.log_prefix(),
+                            tts_generation,
+                            session.tts_generation,
+                        )

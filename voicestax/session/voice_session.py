@@ -65,6 +65,8 @@ class SessionData:
         self.processing_lock: asyncio.Lock = asyncio.Lock()
         #cancel the current assistant response pipeline
         self.cancel_event: asyncio.Event = asyncio.Event()
+        # Tracks ownership of STT mute/unmute across overlapping TTS tasks.
+        self.tts_generation: int = 0
 
         # -------------------------------
         # Timing & analytics
@@ -74,6 +76,8 @@ class SessionData:
 
         # Latency metrics for each stage of the voice session pipeline.
         self.latency_metrics: dict[str, float] = {}
+        # Metrics for the currently handled user turn. Welcome audio has no record.
+        self.current_turn_latency: Optional[dict[str, float]] = None
         self.turn_count: int = 0
         self.language: str = "en"
         
@@ -137,7 +141,28 @@ class SessionData:
         """
         Store latency metric.
         """
+        if self.current_turn_latency is not None:
+            self.current_turn_latency[key] = value
         self.latency_metrics[key] = value
+
+    def start_turn_latency(self, speech_end_time: float, stt_final_time: float) -> None:
+        """Start an isolated latency record for one finalized user turn."""
+        # Keep the turn's speech boundary with its metrics. VAD continues
+        # updating the session-level marker while assistant audio is playing.
+        self.current_turn_latency = {"_speech_end_time": speech_end_time}
+        self.latency_metrics = self.current_turn_latency
+        self.speech_end_time = speech_end_time
+        self.stt_final_time = stt_final_time
+        self.record_latency(
+            "stt_latency",
+            round((stt_final_time - speech_end_time) * 1000, 2),
+        )
+
+    def finish_turn_latency(self) -> dict[str, float]:
+        """Close and return the current turn record."""
+        metrics = self.current_turn_latency or {}
+        self.current_turn_latency = None
+        return metrics
     
     # Logging helper to prefix log messages with the session ID.
     def log_prefix(self) -> str:
@@ -161,6 +186,7 @@ class SessionData:
 
         self.last_activity_time = time.time()
         self.latency_metrics.clear()
+        self.current_turn_latency = None
         self.turn_count = 0
         self.speech_end_time = 0.0
         self.stt_final_time = 0.0

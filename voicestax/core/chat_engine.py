@@ -13,6 +13,7 @@ from typing import Any
 from voicestax.schemas.llm_schemas import LLMResponse
 from voicestax.utils.exceptions import LLMError
 from voicestax.utils.logger import logger
+from voicestax.utils.text_processing import matches_phrase
 
 
 class ChatEngine:
@@ -146,6 +147,138 @@ class ChatEngine:
             trimmed = trimmed[1:]
 
         history[:] = trimmed
+
+    def _parse_structured(
+        self,
+        raw: str,
+        session,
+    ) -> LLMResponse | None:
+        """Return an LLMResponse if the model produced a usable intent/response."""
+
+        try:
+            parsed = LLMResponse.model_validate_json(raw)
+
+            logger.info(
+                "%s [LLM] Structured response parsed successfully: "
+                "intent=%s",
+                session.log_prefix(),
+                parsed.intent,
+            )
+            return parsed
+
+        except Exception:
+            pass
+
+        # Recover the object when the model wrapped it, e.g. a tool-call
+        # shape {"name": ..., "arguments": {...}}, markdown fences, or
+        # a labeled "Intent: ... Response: ..." reply.
+        parsed = self._recover_structured_response(raw)
+
+        if parsed is None:
+            parsed = self._recover_labeled_response(raw)
+
+        if parsed is not None:
+            logger.info(
+                "%s [LLM] Recovered structured response "
+                "from malformed output: intent=%s",
+                session.log_prefix(),
+                parsed.intent,
+            )
+
+        return parsed
+
+    async def _retry_for_json(
+        self,
+        messages: list[dict[str, str]],
+        bad_reply: str,
+        session,
+    ) -> LLMResponse | None:
+        """Ask the model once to reformat its previous reply as JSON.
+
+        The correction turns are only sent with this request; they are
+        never stored in the conversation history.
+        """
+
+        if not bad_reply.strip():
+            return None
+
+        retry_messages = [
+            *messages,
+            {"role": "assistant", "content": bad_reply},
+            {
+                "role": "user",
+                "content": (
+                    "Your last reply was not in the required format. "
+                    "Resend it as exactly one JSON object with the fields "
+                    '"intent" and "response" and nothing else. Keep the '
+                    'same wording in "response".'
+                ),
+            },
+        ]
+
+        logger.info(
+            "%s [LLM] Retrying once to obtain JSON output",
+            session.log_prefix(),
+        )
+
+        try:
+            retry_raw = await self._stream_response(
+                messages=retry_messages,
+                session=session,
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s [LLM] JSON retry failed: %s",
+                session.log_prefix(),
+                exc,
+            )
+            return None
+
+        return self._parse_structured(retry_raw, session)
+
+    @staticmethod
+    def _keyword_intent(user_text: str, settings) -> str:
+        """Guess an intent from the user's own words (no LLM involved)."""
+
+        if not settings.intent_keyword_fallback:
+            return "conversation"
+
+        # Only short messages: avoids ending a call because of e.g.
+        # "I said goodbye to my dog yesterday".
+        max_words = settings.intent_keyword_max_words
+
+        if matches_phrase(user_text, settings.human_handoff_phrases, max_words):
+            return "human_handoff"
+
+        if matches_phrase(user_text, settings.end_conversation_phrases, max_words):
+            return "end_conversation"
+
+        return "conversation"
+
+    def _fallback_response(
+        self,
+        raw: str,
+        user_text: str,
+        session,
+    ) -> LLMResponse:
+        """Build a response from non-JSON model output."""
+
+        if raw.lstrip().startswith(("{", "[")):
+            # Never speak raw JSON to the user.
+            return LLMResponse(
+                intent="conversation",
+                response=self.UNPARSEABLE_RESPONSE,
+            )
+
+        intent = self._keyword_intent(user_text, session.settings)
+
+        logger.warning(
+            "%s [LLM] Using plain-text reply with keyword intent=%s",
+            session.log_prefix(),
+            intent,
+        )
+
+        return LLMResponse(intent=intent, response=raw.strip())
 
     def _build_messages(
         self,
@@ -405,61 +538,45 @@ class ChatEngine:
                 "LLM returned an empty response"
             )
 
-        try:
-            # Parse the full response as JSON to extract the intent and response fields.
-            parsed = LLMResponse.model_validate_json(
-                full_response
-            )
+        parsed = self._parse_structured(full_response, session)
 
-            logger.info(
-                "%s [LLM] Structured response parsed successfully: "
-                "intent=%s",
-                session.log_prefix(),
-                parsed.intent,
-            )
-
-        except Exception:
+        if parsed is None:
             logger.warning(
-                "%s [LLM] Structured response parsing failed. "
+                "%s [LLM] No structured intent in response. "
                 "Raw response starts with: %r",
                 session.log_prefix(),
                 full_response[:300],
             )
 
-            # Recover the intent/response object when the model wrapped it,
-            # e.g. a tool-call shape {"name": ..., "arguments": {...}} or
-            # JSON surrounded by markdown fences or extra text.
-            
-            parsed = self._recover_structured_response(full_response)
+            # 1) Ask the model once to reformat its own reply as JSON.
+            if getattr(session.settings, "llm_json_retry", True):
+                parsed = await self._retry_for_json(
+                    messages, full_response, session
+                )
 
+                if session.cancel_event.is_set():
+                    if history and history[-1] is user_message:
+                        history.pop()
+
+                    raise LLMError(
+                        "LLM response interrupted by barge-in"
+                    )
+
+            # 2) Last resort: plain text reply, intent guessed from keywords.
             if parsed is None:
-                parsed = self._recover_labeled_response(full_response)
-
-            if parsed is not None:
-                logger.info(
-                    "%s [LLM] Recovered structured response "
-                    "from malformed output: intent=%s",
-                    session.log_prefix(),
-                    parsed.intent,
-                )
-            elif full_response.lstrip().startswith(("{", "[")):
-                # Never speak raw JSON to the user.
-                parsed = LLMResponse(
-                    intent="conversation",
-                    response=self.UNPARSEABLE_RESPONSE,
-                )
-            else:
-                # Plain-text reply without a recognized wrapper.
-                parsed = LLMResponse(
-                    intent="conversation",
-                    response=full_response.strip(),
+                parsed = self._fallback_response(
+                    full_response, user_text, session
                 )
 
         # Append the assistant's response to the session conversation history 
+        # Store the assistant turn in the same JSON shape the system prompt
+        # demands. If history holds plain-text assistant turns, the model
+        # imitates them and stops returning {"intent", "response"} JSON,
+        # which breaks intent detection on every provider.
         history.append(
             {
                 "role": "assistant",
-                "content": parsed.response,
+                "content": parsed.model_dump_json(),
             }
         )
 

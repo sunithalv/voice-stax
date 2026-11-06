@@ -162,7 +162,12 @@ class VoiceAgent:
         # Ambiguous phrases such as "I am done" or "that's it" are not
         # handled here; they are sent to the LLM because context matters.
         # ---------------------------------------------------------------
-        local_intent = detect_local_intent(text)
+        settings = self.session.settings
+        local_intent = detect_local_intent(
+            text,
+            settings.end_conversation_phrases,
+            settings.human_handoff_phrases,
+        )
 
         if local_intent is not None:
             logger.info(
@@ -198,8 +203,17 @@ class VoiceAgent:
         intent = "conversation"
         response = self.DEFAULT_ERROR_RESPONSE
         llm_succeeded = False
+        
+        logger.info(
+            "%s [LOCK DEBUG] Waiting for processing lock",
+            self.session.log_prefix(),
+        )
 
         async with self.session.processing_lock:
+            logger.info(
+                "%s [LOCK DEBUG] Acquired processing lock",
+                self.session.log_prefix(),
+            )
             self.session.set_state("processing")
 
             # Clear cancellation from the previous turn before starting

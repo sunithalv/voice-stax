@@ -35,6 +35,10 @@ For each issue, record the symptom, evidence/logs, root cause (or current hypoth
 18. [Maximum VAD utterance duration prematurely ends a long user turn](#18-maximum-vad-utterance-duration-prematurely-ends-a-long-user-turn)
 19. [VAD triggers STT endpoints while TTS has muted the provider](#19-vad-triggers-stt-endpoints-while-tts-has-muted-the-provider)
 20. [TTS playback interruption after barge-in — investigation open](#20-tts-playback-interruption-after-barge-in-investigation-open)
+21. [Latency summaries leak across conversation turns](#21-latency-summaries-leak-across-conversation-turns)
+22. [Total turn latency uses a mutable speech-end timestamp](#22-total-turn-latency-uses-a-mutable-speech-end-timestamp)
+23. [First words of a barge-in are missing from the transcript](#23-first-words-of-a-barge-in-are-missing-from-the-transcript)
+24. [STT latency is abnormally high and total latency is zero](#24-stt-latency-is-abnormally-high-and-total-latency-is-zero)
 
 ---
 
@@ -1774,7 +1778,7 @@ These are diagnostic branches, not conclusions about the cause.
 
 ---
 
-**Last reviewed:** 2026-10-30 (VAD/STT/TTS debugging update)
+**Last reviewed:** 2026-11-06 (barge-in buffering and latency review)
 
 ---
 
@@ -1934,4 +1938,244 @@ Capture one complete affected response from before TTS starts until the browser 
 - [ ] Server chunk counts and browser playback completion agree.
 
 ---
+
+## 21. Latency Summaries Leak Across Conversation Turns
+
+**Status:** Fixed in the current latency logging changes.
+
+### Symptom
+
+Turn summaries could show a previous turn's values, omit timings for interrupted responses, or include the welcome greeting's TTS timing.
+
+### Root cause
+
+Stage metrics were stored in session-wide fields and logged only after the normal message handler returned. Early returns and interrupted TTS could skip or leave incomplete summaries; metrics were not freshly scoped to each user turn.
+
+### Fix
+
+- `SessionData.start_turn_latency()` creates a fresh record when a final user transcript is handled; `finish_turn_latency()` closes it.
+- STT timestamps are captured with the transcript and the summary is logged in a `finally` block, including interrupted/error paths.
+- The welcome greeting runs without an active turn record, so it is excluded.
+
+**Files:** `voicestax/session/voice_session.py`, `voicestax/api/websocket_routes.py`. LLM timings are routed through `SessionData.record_latency()` in `voicestax/core/chat_engine.py`.
+
+---
+
+## 22. Total Turn Latency Uses a Mutable Speech-End Timestamp
+
+**Status:** Fixed in the current latency logging changes.
+
+### Symptom
+
+TOTAL could be much shorter than STT + LLM + TTS, or `0.00ms`, when VAD detected speech during assistant playback. The first-audio log also appeared twice per response.
+
+### Root cause
+
+`AudioManager.stream_text()` calculated TOTAL using `session.speech_end_time`. VAD resets that shared field on `speech_started` and updates it on every `speech_ended`, including events during TTS. If it was reset to zero before the first audio send, TOTAL was skipped. Two code paths also logged the same first chunk as sent.
+
+### Fix
+
+- Store the original speech-end timestamp inside the per-turn latency record and capture that record at TTS start. Calculate TOTAL from this stable timestamp after the first WebSocket audio send succeeds.
+- Remove the duplicate first-chunk log site.
+
+**File:** `voicestax/core/audio_manager.py` (timestamp is initialized in `voicestax/session/voice_session.py`).
+
+---
+
+
+---
+
+## 23. First Words of a Barge-In Are Missing from the Transcript
+
+**Status:** Buffer-and-replay fix implemented in the router and passed two consecutive manual interruption tests (2026-11-06). Re-run these tests after changes to VAD, STT muting, or audio buffering.
+
+### Symptom
+
+When the user starts speaking while the assistant is playing TTS, VoiceStax detects the interruption and cancels TTS, but the beginning of the user's sentence may be missing from the transcript.
+
+The opening words can arrive while AssemblyAI is still muted. If those microphone frames are discarded, STT receives only the later part of the sentence.
+
+### Root cause
+
+`AudioManager` mutes the STT provider while TTS is playing. The router continues receiving microphone audio and running server-side VAD so it can detect a genuine barge-in.
+
+Before the buffering change, speech frames used to establish the barge-in could arrive while STT was muted. Sending them immediately was ineffective because the provider ignored audio while muted. If the router then waited for STT to become ready without retaining those frames, the beginning of the interruption was lost.
+
+### Fix
+
+**File:** `voicestax/api/websocket_routes.py`
+
+Use the router's `stt_send_buffer` to retain speech frames while the assistant is speaking and STT is muted. Once server-side VAD confirms a barge-in:
+
+1. Mark the barge-in as confirmed.
+2. Cancel the active TTS response.
+3. Move the session into the listening state.
+4. Wait for the STT provider to become ready and unmuted.
+5. Replay the buffered speech frames to STT.
+6. Continue sending subsequent microphone audio normally.
+7. When the user's actual speech-end event occurs, flush remaining audio and send `ForceEndpoint`.
+
+The important behaviour is that the audio used to detect the interruption is also retained for transcription; it is not merely used as a trigger.
+
+Illustrative router flow:
+
+```python
+# Accumulate speech frames while VAD processes microphone audio.
+if is_speech:
+    stt_send_buffer.extend(frame)
+
+# Once the barge-in threshold is reached:
+barge_in_confirmed = True
+await agent._cancel_tts(websocket, send_stop_audio=True)
+session.set_state("listening")
+
+if await _wait_for_stt_ready_after_barge_in():
+    if stt_send_buffer:
+        await session.stt_provider.send_audio(bytes(stt_send_buffer))
+        stt_send_buffer.clear()
+```
+
+Keep the readiness check and buffer lifecycle used by the current router. Do not unmute STT directly from `_cancel_tts()`; `AudioManager` owns the TTS-generation-aware mute/unmute lifecycle.
+
+### Barge-in threshold
+
+The tested router used:
+
+```python
+BARGE_IN_MIN_FRAMES = 25  # 500 ms at 20 ms per VAD frame
+```
+
+This threshold is separate from the audio-retention mechanism. If it is changed, retest both false-barge-in resistance and how much of the user's opening speech is retained.
+
+### Verification evidence (2026-11-06)
+
+Two consecutive manual tests completed successfully:
+
+- In the first test, the router replayed **21,120 bytes** after barge-in. The user's interrupted speech was transcribed and the assistant produced a complete response.
+- In the second test, the router replayed **29,440 bytes**. The complete interruption phrase, "Or can we look into transformers?", was transcribed. The assistant responded, and a subsequent "I'm done" turn was also transcribed and handled normally.
+
+These tests support the buffer-and-replay fix in the tested setup. They do not establish that every microphone, noise condition, or STT provider will behave identically.
+
+### Verification checklist
+
+- [ ] Speak immediately when interrupting TTS; the transcript includes the opening words, not only the tail.
+- [ ] Confirm the buffer is replayed only after STT is ready and unmuted.
+- [ ] Confirm buffered bytes are cleared after successful replay and are not duplicated in the next turn.
+- [ ] Background fan noise alone does not confirm barge-in or submit noise as a user turn.
+- [ ] After barge-in, the user's remaining speech is streamed normally and one final endpoint is produced.
+- [ ] Manual stop, disconnect, and session cleanup clear pending audio buffers.
+- [ ] Repeat with short and long interruptions and with supported STT providers.
+
+---
+
+## 24. STT Latency Is Abnormally High and Total Latency Is Zero
+
+**Status:** Likely timestamp race identified from the 2026-11-06 code review and logs. The complete timestamp-correlation and total-latency fix still requires implementation and verification. Do not mark this issue resolved until the tests below pass.
+
+### Symptom
+
+A turn's STT latency can be reported as an implausibly large value, while the total turn latency is logged as `0.00ms`.
+
+Example from the 2026-11-06 test:
+
+```text
+[STT] Final transcript received: Or can we look into transformers?
+latency=300982859.77 ms
+
+LATENCY | STT=300982859.77ms | LLM=947.14ms | TTS=684.24ms | TOTAL=0.00ms
+```
+
+The same test session produced ordinary STT measurements for other turns (approximately 920 ms and 584 ms). The anomalous value is not a realistic transcription duration.
+
+### Likely root cause: shared speech-end timestamp can be reset before the transcript callback reads it
+
+**File:** `voicestax/api/websocket_routes.py`
+
+The current callback reads the shared session field when AssemblyAI delivers the final transcript:
+
+```python
+def on_transcript(text: str, is_final: bool) -> None:
+    if not text or not is_final:
+        return
+
+    session.stt_final_time = time.perf_counter()
+    speech_end_time = session.speech_end_time
+    stt_final_time = session.stt_final_time
+
+    asyncio.create_task(
+        _process_final_transcript(text, speech_end_time, stt_final_time)
+    )
+```
+
+The router also resets `session.speech_end_time` to `0.0` when VAD reports a new `speech_started` event, and updates it on `speech_ended`.
+
+These operations can race: if a later speech-start event resets the shared field before the previous transcript callback reads it, the callback can capture `0.0` instead of the speech-end timestamp for its own turn. Since `time.perf_counter()` has an arbitrary process-relative origin, subtracting zero can produce a huge number that resembles latency but is not.
+
+This is the likely explanation for a value close to the current `perf_counter()` value in milliseconds. Confirm it by logging the captured speech-end timestamp and the STT-final timestamp for the affected turn.
+
+### Separate issue: TOTAL is not being populated reliably
+
+The router's summary reads `total_turn_latency` from the per-turn metrics record. In the reviewed code path, `SessionData.start_turn_latency()` initializes the record and records STT latency, while LLM and TTS stages record their own metrics. The reviewed `VoiceAgent` code did not record `total_turn_latency`.
+
+If no code writes that key, the summary's `.get("total_turn_latency", 0)` naturally prints `0.00ms`. Fixing the STT timestamp alone will not automatically populate TOTAL.
+
+Also distinguish this issue from Issue #22. Issue #22 describes a mutable timestamp being used by the audio manager when calculating TOTAL at first audio send. This entry records the later observed STT callback race and the missing total metric in the reviewed turn-summary path. Check that both paths are consistent before consolidating or removing either entry.
+
+### Recommended fix: associate timestamps with the utterance, not a mutable session field
+
+The STT final callback must use the speech-end time belonging to the utterance that produced that transcript. Do not read a session-wide timestamp that VAD can reset for a subsequent utterance.
+
+A robust implementation should:
+
+1. Capture a monotonic speech-end timestamp when the router detects the actual `speech_ended` event.
+2. Preserve that timestamp as part of the pending STT-turn context until the corresponding final transcript is processed.
+3. At final transcript time, pair the STT-final timestamp with that same turn context and pass both values into `_process_final_transcript()`.
+4. Start the per-turn latency record using those captured values; do not reconstruct speech-end time from the current `session.speech_end_time`.
+5. Define exactly when a pending turn context is created, consumed, expired, or discarded during cancellation, failed endpoint requests, reconnects, and session cleanup.
+
+**Important AssemblyAI constraint:** the reviewed provider callback supplies `(text, is_final)` and does not include a VoiceStax utterance ID. `force_end_turn()` can also return early when its endpoint lock is already held, and a failed or missing transcript may leave an unconsumed pending context. Therefore, do not implement a bare FIFO timestamp queue that blindly pops one timestamp for every callback. First ensure the router's endpoint lifecycle is serialized/correlated and that stale pending contexts have a safe cleanup policy. If the provider integration is later changed to expose a reliable turn identifier, use it for explicit correlation.
+
+Use `time.perf_counter()` consistently for elapsed-time measurements. Do not mix it with `time.time()` wall-clock values.
+
+### Recommended fix: calculate and record TOTAL explicitly
+
+Choose and document one definition for TOTAL. For perceived response latency, a useful definition is:
+
+```text
+TOTAL = time of first audio chunk successfully sent
+        - speech-end time for this user turn
+```
+
+Record this value exactly once, after the first audio WebSocket send succeeds, using the stable speech-end timestamp stored in that turn's latency context. If the intended metric is instead the sum of stage durations, name it separately; stage timings can overlap and need not equal perceived end-to-end latency.
+
+Ensure that:
+
+- `total_turn_latency` is written to the active turn record before `finish_turn_latency()` closes it.
+- The metric is not read from a timestamp that VAD can overwrite during TTS.
+- Interrupted turns and error paths have an explicit policy (for example, record time-to-first-audio only if audio was actually sent; otherwise mark it unavailable rather than reporting a misleading zero).
+- The welcome greeting, which is not a user turn, is not included in a user-turn latency summary.
+
+### Diagnostic logging to add while fixing
+
+For each turn, log a stable turn identifier and these values:
+
+- Timestamp captured at VAD `speech_ended`.
+- Timestamp and turn context selected when the final STT callback arrives.
+- Whether a later `speech_started` event occurred before that callback.
+- STT-final timestamp and calculated STT duration.
+- Timestamp of the first successful audio send.
+- The exact value written as `total_turn_latency` before the summary is logged.
+
+The logs should make it possible to verify that the speech-end timestamp used for STT and TOTAL belongs to the same user utterance.
+
+### Verification checklist
+
+- [ ] STT latency is calculated from the speech-end timestamp belonging to the transcript, even if a later speech-start event occurs before the callback.
+- [ ] No STT latency is calculated from a zero or uninitialized timestamp.
+- [ ] Repeated and rapid user turns do not pair a transcript with the wrong speech-end timestamp.
+- [ ] A delayed, missing, or failed ForceEndpoint does not leave a stale timestamp to be consumed by a later transcript.
+- [ ] `TOTAL` is populated when the defined first-audio event occurs; it is not silently defaulted to zero.
+- [ ] TOTAL uses the same turn's stable speech-end timestamp and is recorded only once.
+- [ ] Interrupted turns, terminal turns, and session cleanup do not leak latency data into later turns.
+- [ ] Normal STT, LLM, TTS, and TOTAL measurements remain plausible across multiple consecutive turns.
 

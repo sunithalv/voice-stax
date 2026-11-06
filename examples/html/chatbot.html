@@ -121,7 +121,6 @@ button{flex:1;padding:10px;border:none;border-radius:8px;cursor:pointer}
     </div>
   </div>
 </div>
-
 <script>
 const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/chat`;
 
@@ -133,14 +132,12 @@ let processor = null;
 let source = null;
 let transcript = [];
 let mp3Chunks = [];
-let bargeInFrames = 0;
 
 let nextPcmStartTime = 0;
 let pcmSources = [];
 const PCM_PREBUFFER_SECONDS = 0.15;
 const MAX_PENDING_AUDIO_FRAMES = 100;
 
-let interruptSent = false;
 let currentAudio = null;
 let assistantSpeaking = false;
 let listeningReady = false;
@@ -165,7 +162,7 @@ function setButtonsEnabled(enabled) {
 
 setButtonsEnabled(false);
 
-function addMsg(type, text){
+function addMsg(type, text) {
 
     const row = document.createElement("div");
 
@@ -190,7 +187,6 @@ function addMsg(type, text){
 
     bubble.className = `msg ${type}`;
 
-    // ── Current local time ───────────────────────────────
     const now = new Date();
 
     const time = now.toLocaleTimeString([], {
@@ -199,11 +195,9 @@ function addMsg(type, text){
         second: "2-digit"
     });
 
-    // Message text
     const textElement = document.createElement("div");
     textElement.textContent = text;
 
-    // Message timestamp
     const timeElement = document.createElement("div");
     timeElement.className = "message-time";
     timeElement.textContent = time;
@@ -211,11 +205,10 @@ function addMsg(type, text){
     bubble.appendChild(textElement);
     bubble.appendChild(timeElement);
 
-    if(type === "user"){
+    if (type === "user") {
         row.appendChild(bubble);
         row.appendChild(avatar);
-    }
-    else{
+    } else {
         row.appendChild(avatar);
         row.appendChild(bubble);
     }
@@ -232,130 +225,96 @@ function addMsg(type, text){
 }
 
 async function startMic() {
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      sampleRate: 16000,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    }
-  });
 
-  audioContext = new AudioContext({
-    sampleRate: 16000
-  });
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+        }
+    });
 
-  source = audioContext.createMediaStreamSource(mediaStream);
+    audioContext = new AudioContext({
+        sampleRate: 16000
+    });
 
-  processor = audioContext.createScriptProcessor(4096, 1, 1);
+    source = audioContext.createMediaStreamSource(mediaStream);
 
-  processor.onaudioprocess = (event) => {
-    console.log("onaudioprocess fired");
+    processor = audioContext.createScriptProcessor(4096, 1, 1);
 
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return;
-    }
+    processor.onaudioprocess = (event) => {
 
-    const inputData = event.inputBuffer.getChannelData(0);
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
 
-    console.log("Mic samples:", inputData.length);
+        const inputData = event.inputBuffer.getChannelData(0);
 
-    const outputData = event.outputBuffer.getChannelData(0);
-    outputData.fill(0);
+        const outputData = event.outputBuffer.getChannelData(0);
+        outputData.fill(0);
 
-    let energy = 0;
+        // Convert microphone Float32 samples to PCM Int16.
+        const pcm = new Int16Array(inputData.length);
 
-    for (let i = 0; i < inputData.length; i++) {
-        energy += inputData[i] * inputData[i];
-    }
+        for (let i = 0; i < inputData.length; i++) {
+            const s = Math.max(-1, Math.min(1, inputData[i]));
+            pcm[i] = s < 0 ? s * 32768 : s * 32767;
+        }
 
-    const rms = Math.sqrt(energy / inputData.length);
+        // Continue sending microphone audio while the assistant is speaking.
+        // The server handles VAD, buffering and barge-in detection.
+        if (ws && ws.readyState === WebSocket.OPEN) {
 
-    if (assistantSpeaking && !interruptSent && rms > 0.06) {
-        bargeInFrames++;
-    } else {
-        bargeInFrames = 0;
-    }
+            if (listeningReady) {
 
-    if (
-        assistantSpeaking &&
-        !interruptSent &&
-        bargeInFrames >= 2 &&
-        ws.readyState === WebSocket.OPEN
-    ) {
-        interruptSent = true;
-        bargeInFrames = 0;
+                ws.send(pcm.buffer);
 
-        console.log("BARGE-IN DETECTED", { rms });
+            } else if (bufferingAudio) {
 
-        ws.send(JSON.stringify({ type: "interrupt" }));
-        stopAudio();
-    }
-
-    // Don't send microphone audio until the greeting is finished
-    // and the server confirms that STT is ready.
-    // if (!listeningReady) {
-    //     return;
-    // }
-
-    const pcm = new Int16Array(inputData.length);
-
-    for (let i = 0; i < inputData.length; i++) {
-        const s = Math.max(-1, Math.min(1, inputData[i]));
-        pcm[i] = s < 0 ? s * 32768 : s * 32767;
-    }
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        if (listeningReady) {
-            ws.send(pcm.buffer);
-        }else if (bufferingAudio) {
-            if (pendingAudioFrames.length < MAX_PENDING_AUDIO_FRAMES) {
-                pendingAudioFrames.push(pcm.slice());
-            } else {
-                console.warn("Pending audio buffer limit reached");
+                if (pendingAudioFrames.length < MAX_PENDING_AUDIO_FRAMES) {
+                    pendingAudioFrames.push(pcm.slice());
+                } else {
+                    console.warn("Pending audio buffer limit reached");
+                }
             }
         }
-    }
-    console.log("Sent", pcm.byteLength, "bytes");
-};
+    };
 
-  source.connect(processor);
-  processor.connect(audioContext.destination);
- // processor.disconnect();
+    source.connect(processor);
+    processor.connect(audioContext.destination);
 }
 
 function stopMic() {
 
-  if (processor) {
-    processor.disconnect();
-    processor = null;
-  }
+    if (processor) {
+        processor.disconnect();
+        processor = null;
+    }
 
-  if (source) {
-    source.disconnect();
-    source = null;
-  }
+    if (source) {
+        source.disconnect();
+        source = null;
+    }
 
-  if (audioContext) {
-    audioContext.close();
-    audioContext = null;
-  }
+    if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+    }
 
-  if (mediaStream) {
-    mediaStream.getTracks().forEach(track => track.stop());
-    mediaStream = null;
-  }
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+    }
 }
 
 function stopAudio() {
 
     playbackGeneration++;
     assistantSpeaking = false;
-    interruptSent = true;
-    bargeInFrames = 0;
 
-    // ── Stop MP3 ─────────────────────────────────────────
+    // Stop MP3 playback.
     if (currentAudio) {
         currentAudio.pause();
         currentAudio.currentTime = 0;
@@ -364,12 +323,12 @@ function stopAudio() {
 
     mp3Chunks = [];
 
-    // ── Stop PCM ─────────────────────────────────────────
+    // Stop PCM playback.
     pcmSources.forEach(sourceNode => {
         try {
             sourceNode.stop();
         } catch (e) {
-            // Already stopped/finished
+            // Already stopped/finished.
         }
     });
 
@@ -382,14 +341,14 @@ async function playPCMChunk(bytes) {
     const generation = playbackGeneration;
     const sampleRate = 24000; // ElevenLabs pcm_24000
 
-    // Create separate playback context
+    // Create separate playback context.
     if (!playbackAudioContext) {
         playbackAudioContext = new AudioContext({
             sampleRate: sampleRate
         });
     }
 
-    // Resume if browser suspended it
+    // Resume if browser suspended it.
     if (playbackAudioContext.state === "suspended") {
         await playbackAudioContext.resume();
     }
@@ -399,21 +358,21 @@ async function playPCMChunk(bytes) {
         return;
     }
 
-    // PCM s16le = signed 16-bit little-endian samples
+    // PCM s16le = signed 16-bit little-endian samples.
     const int16Array = new Int16Array(
         bytes.buffer,
         bytes.byteOffset,
         Math.floor(bytes.byteLength / 2)
     );
 
-    // Convert Int16 PCM → Float32 Web Audio samples
+    // Convert Int16 PCM to Float32 Web Audio samples.
     const float32Array = new Float32Array(int16Array.length);
 
     for (let i = 0; i < int16Array.length; i++) {
         float32Array[i] = int16Array[i] / 32768;
     }
 
-    // Create mono audio buffer
+    // Create mono audio buffer.
     const audioBuffer = playbackAudioContext.createBuffer(
         1,
         float32Array.length,
@@ -428,9 +387,7 @@ async function playPCMChunk(bytes) {
     sourceNode.buffer = audioBuffer;
     sourceNode.connect(playbackAudioContext.destination);
 
-    // Schedule chunks continuously to avoid gaps. When the queue is empty
-    // (stream start or underrun), start slightly in the future so network
-    // jitter on the next chunks doesn't cause audible breaks.
+    // Schedule chunks continuously to avoid gaps.
     const now = playbackAudioContext.currentTime;
     const chunkDuration = bytes.byteLength / (sampleRate * 2);
 
@@ -446,6 +403,7 @@ async function playPCMChunk(bytes) {
         nextPcmStartTime: nextPcmStartTime.toFixed(3),
         schedulingGapMs: (schedulingGap * 1000).toFixed(1)
     });
+
     const startTime = nextPcmStartTime > now
         ? nextPcmStartTime
         : now + PCM_PREBUFFER_SECONDS;
@@ -458,8 +416,6 @@ async function playPCMChunk(bytes) {
     pcmSources.push(sourceNode);
 
     assistantSpeaking = true;
-    interruptSent = false;
-    bargeInFrames = 0;
 
     sourceNode.onended = () => {
         pcmSources = pcmSources.filter(
@@ -469,6 +425,7 @@ async function playPCMChunk(bytes) {
 }
 
 function setConnectionStatus(state, text) {
+
     statusEl.textContent = text;
 
     statusEl.classList.remove(
@@ -480,12 +437,10 @@ function setConnectionStatus(state, text) {
     statusEl.classList.add(state);
 }
 
-function connect(){
+function connect() {
 
-    // Initial state
     setConnectionStatus("disconnected", "Disconnected");
 
-    // Give the user a moment to see the initial state
     setTimeout(() => {
 
         setConnectionStatus("connecting", "Connecting...");
@@ -506,7 +461,7 @@ function connect(){
 
             console.log(msg.type, msg.encoding);
 
-            if(msg.type === "system_ready"){
+            if (msg.type === "system_ready") {
 
                 setConnectionStatus(
                     "connected",
@@ -518,11 +473,13 @@ function connect(){
                 return;
             }
 
-            if(msg.type === "transcript"){
+            if (msg.type === "transcript") {
+
                 addMsg(
                     msg.speaker === "assistant" ? "ai" : "user",
                     msg.text
                 );
+
                 return;
             }
 
@@ -536,17 +493,13 @@ function connect(){
                     bytes[i] = binary.charCodeAt(i);
                 }
 
-
                 if (msg.encoding === "pcm_s16le") {
                     playPCMChunk(bytes);
                     return;
                 }
 
-                
                 if (msg.encoding === "mp3") {
-
                     mp3Chunks.push(bytes);
-
                     return;
                 }
 
@@ -580,9 +533,7 @@ function connect(){
                             assistantSpeaking = false;
                             nextPcmStartTime = 0;
 
-                            console.log(
-                                "PCM playback completed"
-                            );
+                            console.log("PCM playback completed");
 
                         } else {
 
@@ -608,7 +559,6 @@ function connect(){
                 currentAudio = new Audio(url);
 
                 assistantSpeaking = true;
-                interruptSent = false;
 
                 currentAudio.onended = () => {
 
@@ -634,14 +584,15 @@ function connect(){
                 return;
             }
 
-            if(msg.type === "word"){
+            if (msg.type === "word") {
                 return;
             }
 
-            if(msg.type === "clear_audio") {
+            if (msg.type === "clear_audio") {
 
                 console.log("CLEAR_AUDIO RECEIVED");
 
+                // Keep this: the server uses it to stop browser playback.
                 stopAudio();
 
                 return;
@@ -675,8 +626,7 @@ function connect(){
 
             if (msg.type === "session_ended") {
 
-                statusEl.textContent =
-                    "Session ended";
+                statusEl.textContent = "Session ended";
 
                 stopMic();
 
@@ -687,39 +637,40 @@ function connect(){
 
             if (msg.type === "greeting_started") {
 
-                statusEl.textContent =
-                    "Assistant speaking...";
+                statusEl.textContent = "Assistant speaking...";
 
                 return;
             }
 
             if (msg.type === "greeting_done") {
+
                 bufferingAudio = true;
-                statusEl.textContent =
-                    "Greeting completed";
+
+                statusEl.textContent = "Greeting completed";
 
                 return;
             }
 
             if (msg.type === "listening_ready") {
+
                 for (const frame of pendingAudioFrames) {
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(frame.buffer);
                     }
                 }
+
                 pendingAudioFrames = [];
                 bufferingAudio = false;
                 listeningReady = true;
-                statusEl.textContent =
-                    "Listening...";
+
+                statusEl.textContent = "Listening...";
 
                 return;
             }
 
             if (msg.type === "status") {
 
-                statusEl.textContent =
-                    msg.text;
+                statusEl.textContent = msg.text;
 
                 return;
             }
@@ -731,8 +682,7 @@ function connect(){
                     "Connecting you to a human agent..."
                 );
 
-                statusEl.textContent =
-                    "Human handoff";
+                statusEl.textContent = "Human handoff";
 
                 stopMic();
 
@@ -770,7 +720,7 @@ document.getElementById("start").onclick = async () => {
     const unlock = new Audio();
     unlock.play().catch(() => {});
 
-    if(!ws || ws.readyState !== WebSocket.OPEN){
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
         console.error("WebSocket not connected");
         return;
     }
@@ -778,41 +728,49 @@ document.getElementById("start").onclick = async () => {
     listeningReady = false;
     bufferingAudio = false;
     pendingAudioFrames = [];
+
     await startMic();
+
     ws.send(JSON.stringify({ type: "start" }));
 };
 
 document.getElementById("stop").onclick = () => {
-  listeningReady = false;
-  bufferingAudio = false;
-  pendingAudioFrames = [];
-  if(ws && ws.readyState === WebSocket.OPEN){
-    ws.send(JSON.stringify({ type: "stop" }));
-  }
-  stopMic();
-  stopAudio();
+
+    listeningReady = false;
+    bufferingAudio = false;
+    pendingAudioFrames = [];
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "stop" }));
+    }
+
+    stopMic();
+    stopAudio();
 };
 
 document.getElementById("clear").onclick = () => {
-  chat.innerHTML = "";
-  transcript = [];
-  stopAudio();
+
+    chat.innerHTML = "";
+    transcript = [];
+
+    stopAudio();
 };
 
 document.getElementById("download").onclick = () => {
-  const text = transcript
-    .map(m => `${m.role.toUpperCase()}: ${m.text}`)
-    .join("\n");
 
-  const blob = new Blob([text], { type: "text/plain" });
-  const url = URL.createObjectURL(blob);
+    const text = transcript
+        .map(m => `${m.role.toUpperCase()}: ${m.text}`)
+        .join("\n");
 
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "transcript.txt";
-  a.click();
+    const blob = new Blob([text], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
 
-  URL.revokeObjectURL(url);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "transcript.txt";
+    a.click();
+
+    URL.revokeObjectURL(url);
 };
 
 connect();

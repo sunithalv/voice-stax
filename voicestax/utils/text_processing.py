@@ -25,72 +25,68 @@ def split_into_words(text: str) -> List[str]:
     return text_clean.split()
 
 
-# ------------------ Goodbye Detection ----------------
-
-GOODBYE_PHRASES = {
-    "bye",
-    "goodbye",
-    "bye bye",
-    "good bye",
-    "see you",
-    "see you later",
-    "talk to you later",
-    "have a good day",
-    "have a nice day",
-    "thanks bye",
-    "thank you bye",
-    "you can end the call",
-    "end the call",
-}
-
-
-def is_goodbye(text: str) -> bool:
-    """
-    Return True only for a clear, standalone goodbye phrase.
-
-    Ambiguous phrases such as 'I am done' or 'that's it' are
-    intentionally not included because they require context.
-    """
-    return clean_text(text) in GOODBYE_PHRASES
-
-
-# ------------------ Human Handoff Detection ----------------
-
-HUMAN_HANDOFF_PHRASES = {
-    "connect me to a human",
-    "connect me to an agent",
-    "speak to a human",
-    "speak to an agent",
-    "talk to a human",
-    "talk to an agent",
-    "transfer me to an agent",
-    "i want a human",
-}
-
-
-def is_human_handoff_request(text: str) -> bool:
-    """Return True for clear requests to speak with a human agent."""
-    return clean_text(text) in HUMAN_HANDOFF_PHRASES
-
-
 # ------------------ Local Intent Detection ----------------
+#
+# The phrase lists live in VoiceSettings (end_conversation_phrases and
+# human_handoff_phrases) so there is a single place to configure them.
 
-def detect_local_intent(text: str) -> str | None:
+def _normalize_for_match(text: str) -> str:
+    """Lowercase and drop punctuation so 'Goodbye.' matches 'goodbye'.
+
+    STT providers with formatted turns add capitalization and
+    punctuation ("Bye!", "Thanks, bye."), which must not defeat matching.
+    """
+    return clean_text(re.sub(r"[^\w\s']", " ", text))
+
+
+def _normalize_phrases(phrases) -> set[str]:
+    return {_normalize_for_match(p) for p in phrases if p and p.strip()}
+
+
+def matches_phrase(text: str, phrases, max_words: int | None = None) -> bool:
+    """Match user text against configured phrases.
+
+    With max_words=None the whole utterance must equal a phrase (high
+    confidence, used for local intents). With max_words set, a phrase may
+    appear inside a message of at most that many words (looser, used only
+    as a last-resort fallback when the LLM gave no intent).
+    """
+    normalized = _normalize_for_match(text)
+
+    if max_words is None:
+        return normalized in _normalize_phrases(phrases)
+
+    if len(normalized.split()) > max_words:
+        return False
+
+    padded = f" {normalized} "
+    return any(f" {p} " in padded for p in _normalize_phrases(phrases))
+
+
+def detect_local_intent(
+    text: str,
+    end_conversation_phrases,
+    human_handoff_phrases,
+) -> str | None:
     """
     Detect high-confidence intents without calling the LLM.
 
     Returns:
-        'end_conversation' for explicit goodbye phrases.
-        'human_handoff' for explicit human-agent requests.
+        'end_conversation' when the whole utterance is a goodbye phrase.
+        'human_handoff' when the whole utterance is a handoff phrase.
         None when the utterance needs LLM interpretation.
+
+    Ambiguous phrases such as 'I am done' or 'that's it' should not be
+    added to the lists; they need context and are left to the LLM.
     """
-    if is_goodbye(text):
+    if matches_phrase(text, end_conversation_phrases):
         return "end_conversation"
 
-    if is_human_handoff_request(text):
+    if matches_phrase(text, human_handoff_phrases):
         return "human_handoff"
 
     return None
+
 
 def prepare_text_for_tts(text: str) -> str:
     """
