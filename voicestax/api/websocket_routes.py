@@ -6,6 +6,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 import asyncio
 import json
+import math
+import struct
 import time
 from collections import deque
 from voicestax.session.voice_session import SessionData
@@ -195,39 +197,62 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
             # Continue processing even if displaying the transcript failed.
             await _handle_message(text, speech_end_time, stt_final_time)
 
-        # Callback for receiving final transcripts from the STT provider
+        # Events from local VAD and AssemblyAI can arrive in either order.
+        # Pair them in FIFO order before processing a final transcript.
+        pending_speech_end_times = deque()
+        pending_final_transcripts = deque()
+
+        def _dispatch_paired_transcripts() -> None:
+            """Dispatch final transcripts only when a VAD end timestamp exists."""
+
+            while (
+                pending_speech_end_times
+                and pending_final_transcripts
+            ):
+                speech_end_time = pending_speech_end_times.popleft()
+                text, stt_final_time = pending_final_transcripts.popleft()
+
+                logger.info(
+                    "%s [STT] Pairing final transcript with VAD speech end",
+                    log_prefix,
+                )
+
+                asyncio.create_task(
+                    _process_final_transcript(
+                        text,
+                        speech_end_time,
+                        stt_final_time,
+                    )
+                )
+
+        # Callback for receiving transcripts from the STT provider.
         def on_transcript(text: str, is_final: bool) -> None:
-            """Receive transcript callbacks from the STT provider."""
+            """Queue final transcripts until their VAD timestamps are available."""
 
             if not text or not is_final:
                 return
 
             stt_final_time = time.perf_counter()
 
-            if pending_speech_end_times:
-                speech_end_time = pending_speech_end_times.popleft()
-            else:
-                speech_end_time = 0.0
-
-                logger.warning(
-                    "%s [STT] Final transcript received without a pending "
-                    "speech-end timestamp",
-                    session.log_prefix(),
-                )
+            pending_final_transcripts.append(
+                (text, stt_final_time)
+            )
 
             logger.info(
                 "%s [STT] Final transcript received: %s",
-                session.log_prefix(),
+                log_prefix,
                 text,
             )
 
-            asyncio.create_task(
-                _process_final_transcript(
-                    text,
-                    speech_end_time,
-                    stt_final_time,
-                )
+            logger.debug(
+                "%s [STT] Pending final transcripts=%d | "
+                "Pending speech-end timestamps=%d",
+                log_prefix,
+                len(pending_final_transcripts),
+                len(pending_speech_end_times),
             )
+
+            _dispatch_paired_transcripts()
         
         # Callback for handling errors from the STT provider
         stt_reconnecting = False
@@ -365,13 +390,87 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
         endpoint_speech_frames = 0
         MIN_ENDPOINT_SPEECH_FRAMES = 10  # 200 ms at 20 ms frames
         BARGE_IN_MIN_FRAMES = 25  # 500 ms of sustained speech to interrupt TTS
+        barge_in_rms_response_key = None
+        barge_in_rms_stats = {
+            "speech": {"count": 0, "sum": 0.0, "min": None, "max": None},
+            "non_speech": {"count": 0, "sum": 0.0, "min": None, "max": None},
+        }
+        
+        # RMS calculation for little-endian signed PCM16 audio
+        def _pcm16_frame_rms(frame: bytes) -> float:
+            """Return linear RMS for one little-endian signed PCM16 frame."""
+            sample_count = len(frame) // 2
+            if sample_count == 0:
+                return 0.0
+            sum_squares = sum(
+                sample * sample
+                for (sample,) in struct.iter_unpack("<h", frame[:sample_count * 2])
+            )
+            return math.sqrt(sum_squares / sample_count)
+
+        def _log_and_reset_barge_in_rms(reason: str) -> None:
+            """Log one response-period snapshot, then clear it atomically."""
+            speech = barge_in_rms_stats["speech"]
+            non_speech = barge_in_rms_stats["non_speech"]
+            response_key = barge_in_rms_response_key
+            if response_key is None:
+                return
+
+            def _formatted_stats(stats):
+                if not stats["count"]:
+                    return "n/a", "n/a", "n/a"
+                return (
+                    f"{stats['min']:.2f}",
+                    f"{stats['max']:.2f}",
+                    f"{stats['sum'] / stats['count']:.2f}",
+                )
+
+            speech_min, speech_max, speech_avg = _formatted_stats(speech)
+            non_speech_min, non_speech_max, non_speech_avg = _formatted_stats(non_speech)
+            try:
+                logger.info(
+                    "%s [BARGE-IN RMS SHADOW] event=%s response_id=%s "
+                    "tts_generation=%s vad_positive_frames=%d "
+                    "vad_positive_rms_min_pcm16_lsb=%s "
+                    "vad_positive_rms_max_pcm16_lsb=%s "
+                    "vad_positive_rms_avg_pcm16_lsb=%s vad_negative_frames=%d "
+                    "vad_negative_rms_min_pcm16_lsb=%s "
+                    "vad_negative_rms_max_pcm16_lsb=%s "
+                    "vad_negative_rms_avg_pcm16_lsb=%s",
+                    log_prefix,
+                    reason,
+                    response_key[0],
+                    response_key[1],
+                    speech["count"],
+                    speech_min,
+                    speech_max,
+                    speech_avg,
+                    non_speech["count"],
+                    non_speech_min,
+                    non_speech_max,
+                    non_speech_avg,
+                )
+            finally:
+                _reset_barge_in_rms_stats()
+
+        def _reset_barge_in_rms_stats() -> None:
+            nonlocal barge_in_rms_response_key
+            barge_in_rms_response_key = None
+            for stats in barge_in_rms_stats.values():
+                stats["count"] = 0
+                stats["sum"] = 0.0
+                stats["min"] = None
+                stats["max"] = None
+
+        def _add_barge_in_rms(is_speech: bool, frame_rms: float) -> None:
+            stats = barge_in_rms_stats["speech" if is_speech else "non_speech"]
+            stats["count"] += 1
+            stats["sum"] += frame_rms
+            stats["min"] = frame_rms if stats["min"] is None else min(stats["min"], frame_rms)
+            stats["max"] = frame_rms if stats["max"] is None else max(stats["max"], frame_rms)
+
         # Strong references so background endpoint tasks aren't garbage-collected.
-        endpoint_tasks: set[asyncio.Task] = set()
-        
-        # Speech-end timestamps waiting for their corresponding final STT transcripts.
-        pending_speech_end_times = deque()
-        
-        force_endpoint_in_progress = False
+        endpoint_tasks: set[asyncio.Task] = set()       
 
         async def _force_end_turn() -> None:
             force_endpoint_start = time.perf_counter()
@@ -421,6 +520,7 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
             nonlocal barge_in_speech_frames
             nonlocal endpoint_speech_frames
             nonlocal barge_in_confirmed
+            nonlocal barge_in_rms_response_key
             try:
                 
                 # Process through VAD
@@ -433,6 +533,32 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                     is_speech = vad.is_speech(frame)
 
                     events = vad_manager.process_frame(is_speech)
+
+                    # Shadow telemetry is scoped to one TTS response generation.
+                    # It observes every incoming frame while speaking, without
+                    # affecting VAD, the candidate counter, or audio forwarding.
+                    assistant_speaking = (
+                        session.state == "speaking" and session.is_speaking
+                    )
+                    if assistant_speaking:
+                        response_key = (
+                            session.current_response_id,
+                            session.tts_generation,
+                        )
+                        if (
+                            barge_in_rms_response_key is not None
+                            and response_key != barge_in_rms_response_key
+                        ):
+                            _log_and_reset_barge_in_rms(
+                                "response_generation_changed"
+                            )
+                        barge_in_rms_response_key = response_key
+                        _add_barge_in_rms(
+                            is_speech,
+                            _pcm16_frame_rms(frame),
+                        )
+                    elif barge_in_rms_response_key is not None:
+                        _log_and_reset_barge_in_rms("assistant_stopped")
 
                     # Buffer speech audio for STT.
                     if is_speech:
@@ -548,12 +674,45 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                             endpoint_speech_frames = 0
                             continue
 
-                        session.speech_end_time = time.perf_counter()
+                        
+                        speech_end_time = time.perf_counter()
+                        session.speech_end_time = speech_end_time
 
                         logger.info(
                             "%s [VAD] Speech ended",
                             log_prefix,
                         )
+
+                        speech_frames_in_turn = endpoint_speech_frames
+                        endpoint_speech_frames = 0
+
+                        # Reset only after the utterance has ended.
+                        barge_in_confirmed = False
+
+                        if speech_frames_in_turn < MIN_ENDPOINT_SPEECH_FRAMES:
+                            logger.debug(
+                                "%s [VAD] Speech too short for ForceEndpoint: %d frames",
+                                log_prefix,
+                                speech_frames_in_turn,
+                            )
+                            continue
+
+                        # Queue the timestamp BEFORE any further await.
+                        # AssemblyAI may already have delivered its final
+                        # transcript while local VAD was detecting silence.
+                        pending_speech_end_times.append(speech_end_time)
+
+                        logger.debug(
+                            "%s [VAD] Queued speech-end timestamp. "
+                            "Pending timestamps=%d | Pending transcripts=%d",
+                            log_prefix,
+                            len(pending_speech_end_times),
+                            len(pending_final_transcripts),
+                        )
+
+                        # If AssemblyAI's final transcript arrived early,
+                        # pair it with this timestamp now.
+                        _dispatch_paired_transcripts()
 
                         # Make sure STT is ready before sending buffered audio.
                         if not _stt_can_receive_audio():
@@ -589,27 +748,10 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
 
                             stt_send_buffer.clear()
 
-                        speech_frames_in_turn = endpoint_speech_frames
-                        endpoint_speech_frames = 0
-
-                        # Reset only after the utterance has been flushed.
-                        barge_in_confirmed = False
-
-                        if speech_frames_in_turn < MIN_ENDPOINT_SPEECH_FRAMES:
-                            logger.debug(
-                                "%s [VAD] Speech too short for ForceEndpoint: %d frames",
-                                log_prefix,
-                                speech_frames_in_turn,
-                            )
-                            continue
-
                         logger.info(
                             "%s Sending ForceEndpoint to STT",
                             log_prefix,
                         )
-
-                        # Save this utterance's speech-end time before requesting finalization.
-                        pending_speech_end_times.append(session.speech_end_time)
 
                         task = asyncio.create_task(_force_end_turn())
                         endpoint_tasks.add(task)
@@ -771,10 +913,13 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                         "%s Stop requested by frontend",
                         log_prefix,
                     )
+                    _log_and_reset_barge_in_rms("session_stopped")
                     stt_accepting = False
                     vad_manager.reset()
                     vad_buffer.clear()
                     stt_send_buffer.clear()
+                    pending_speech_end_times.clear()
+                    pending_final_transcripts.clear()
                     session.stt_provider.stop_streaming()
                     break
                 
@@ -813,6 +958,7 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
                 "%s Cleaning up session resources",
                 log_prefix,
             )
+            _log_and_reset_barge_in_rms("session_cleanup")
             stt_accepting = False
             # Cancel any normal-response TTS task before closing the WebSocket.
             # Do not try to send clear_audio during cleanup.
@@ -847,6 +993,8 @@ def create_router(settings: VoiceSettings, custom_llm_provider=None) -> APIRoute
             vad_manager.reset()
             vad_buffer.clear()
             stt_send_buffer.clear()
+            pending_speech_end_times.clear()
+            pending_final_transcripts.clear()
             if session.stt_provider and session.stt_provider.is_listening():
                 session.stt_provider.stop_streaming()
             session.reset_session()

@@ -222,7 +222,7 @@ class ChatEngine:
         )
 
         try:
-            retry_raw = await self._stream_response(
+            retry_raw, _ = await self._stream_response(
                 messages=retry_messages,
                 session=session,
             )
@@ -306,25 +306,26 @@ class ChatEngine:
         self,
         messages: list[dict[str, str]],
         session,
-    ) -> str:
+    ) -> tuple[str, float | None]:
         """
         Execute the synchronous provider stream in a worker thread.
 
-        This prevents the synchronous SDK from blocking the
-        asyncio event loop.
+        Returns:
+            A tuple containing the complete response and LLM TTFT in ms.
         """
 
-        def consume_stream() -> str:
+        def consume_stream() -> tuple[str, float | None]:
             full_response = ""
-            
-            # Call the provider's stream_chat method to get a streaming response.
+            first_token_latency = None
+
+            # Start timing immediately before requesting the stream.
+            request_start = time.perf_counter()
+
             stream = self.llm_client.stream_chat(
                 messages=messages
             )
-            
-            # Iterate over the streaming chunks and build the full response.
+
             for chunk in stream:
-                # Check if the session has been interrupted (e.g., by barge-in).
                 if session.cancel_event.is_set():
                     logger.info(
                         "%s [LLM] Streaming interrupted by barge-in",
@@ -334,13 +335,20 @@ class ChatEngine:
 
                 try:
                     choices = chunk.choices
-                    
+
                     if not choices:
                         continue
 
                     delta = choices[0].delta
 
                     if delta and delta.content:
+                        # Record only the first non-empty content chunk.
+                        if first_token_latency is None:
+                            first_token_latency = round(
+                                (time.perf_counter() - request_start) * 1000,
+                                2,
+                            )
+
                         full_response += delta.content
 
                 except (AttributeError, IndexError, TypeError) as exc:
@@ -350,8 +358,8 @@ class ChatEngine:
                         exc,
                     )
 
-            return full_response
-        
+            return full_response, first_token_latency
+
         system_prompt = next(
             (
                 message["content"]
@@ -370,6 +378,7 @@ class ChatEngine:
         )
 
         return await asyncio.to_thread(consume_stream)
+
 
     async def get_intent_and_response(
         self,
@@ -416,10 +425,12 @@ class ChatEngine:
             session.log_prefix(),
             len(messages),
         )
+        
+        llm_ttft = None
 
         try:
             # Stream the response from the LLM provider in a separate thread to avoid blocking the event loop.
-            full_response = await self._stream_response(
+            full_response, llm_ttft = await self._stream_response(
                 messages=messages,
                 session=session,
             )
@@ -500,6 +511,17 @@ class ChatEngine:
                 "llm_latency",
                 round(llm_latency, 2),
             )
+            if llm_ttft is not None:
+                session.record_latency(
+                    "llm_ttft",
+                    llm_ttft,
+                )
+
+                logger.info(
+                    "%s [LLM] Time to first token: %.2f ms",
+                    session.log_prefix(),
+                    llm_ttft,
+                )
 
             logger.info(
                 "%s [LLM] Stream finished: chars=%d latency=%.2f ms",
